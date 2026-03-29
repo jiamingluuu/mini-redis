@@ -10,7 +10,7 @@ use crate::types::{hash::Hash, list::List};
 ///
 /// We encode the type directly in the enum variant, which lets the compiler
 /// enforce type safety at no runtime cost.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) enum RedisObject {
     Str(Bytes),
     Hash(Hash),

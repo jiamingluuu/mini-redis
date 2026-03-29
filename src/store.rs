@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use tokio::sync::{mpsc, oneshot};
 
 use crate::cmd::{Command, CommandHandler, IntoResp};
@@ -17,6 +19,15 @@ pub(crate) enum StoreCmd {
     },
     /// Trigger an explicit AOF fsync and reply with +OK or an error.
     Save { reply: oneshot::Sender<Frame> },
+    /// Snapshot the Db to an RDB file in a background task.
+    ///
+    /// REDIS: BGSAVE in rdb.c — Redis forks and the child writes the snapshot.
+    /// We can't fork, so we clone the Db (cheap: Bytes are Arc'd) and spawn a
+    /// tokio task instead. The reply is sent immediately with +OK.
+    BgSave {
+        path: PathBuf,
+        reply: oneshot::Sender<Frame>,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -100,6 +111,18 @@ impl Store {
                 };
                 let _ = reply.send(frame);
             }
+            StoreCmd::BgSave { path, reply } => {
+                // REDIS: BGSAVE clones the Db snapshot, replies immediately,
+                // and writes the RDB file in the background. In production Redis
+                // this is a fork(); we use Db::clone() + tokio::spawn instead.
+                let snapshot = self.db.clone();
+                let _ = reply.send(Frame::Simple("Background saving started".into()));
+                tokio::spawn(async move {
+                    if let Err(e) = crate::persist::rdb::encode(&snapshot, &path) {
+                        eprintln!("BGSAVE error: {e}");
+                    }
+                });
+            }
         }
     }
 
@@ -148,6 +171,21 @@ impl StoreHandle {
         self.tx
             .send(StoreCmd::Execute {
                 cmd,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| anyhow::anyhow!("store actor is gone"))?;
+        reply_rx
+            .await
+            .map_err(|_| anyhow::anyhow!("store actor dropped reply"))
+    }
+
+    /// Send a BGSAVE command to snapshot the Db to an RDB file.
+    pub(crate) async fn bgsave(&self, path: PathBuf) -> anyhow::Result<Frame> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.tx
+            .send(StoreCmd::BgSave {
+                path,
                 reply: reply_tx,
             })
             .await
@@ -901,5 +939,84 @@ mod tests {
             &Bytes::from_static(b"good_val")
         );
         assert_eq!(db.get_str("cra"), Ok(None));
+    }
+
+    // --- BGSAVE integration ---
+
+    /// BGSAVE: populate store → bgsave → wait → decode RDB → verify data.
+    #[tokio::test]
+    async fn bgsave_produces_valid_rdb() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let rdb_path = dir.path().join("dump.rdb");
+
+        let (h, store) = StoreHandle::new(Db::new(), None);
+        tokio::spawn(store.run());
+
+        // String
+        exec(
+            &h,
+            Command::Write(WriteCmd::String(StringWrite::Set(
+                "str_key".into(),
+                Bytes::from_static(b"str_val"),
+            ))),
+        )
+        .await;
+
+        // Hash
+        exec(
+            &h,
+            Command::Write(WriteCmd::Hash(HashWrite::HSet(
+                "hash_key".into(),
+                vec![
+                    (Bytes::from_static(b"f1"), Bytes::from_static(b"v1")),
+                    (Bytes::from_static(b"f2"), Bytes::from_static(b"v2")),
+                ],
+            ))),
+        )
+        .await;
+
+        // List
+        exec(
+            &h,
+            Command::Write(WriteCmd::List(ListWrite::RPush(
+                "list_key".into(),
+                vec![
+                    Bytes::from_static(b"a"),
+                    Bytes::from_static(b"b"),
+                    Bytes::from_static(b"c"),
+                ],
+            ))),
+        )
+        .await;
+
+        // Trigger BGSAVE
+        let result = h.bgsave(rdb_path.clone()).await.unwrap();
+        assert_eq!(result, Frame::Simple("Background saving started".into()));
+
+        // Wait for background task to finish writing
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // Decode and verify
+        let db = crate::persist::rdb::decode(&rdb_path).unwrap();
+        assert_eq!(
+            db.get_str("str_key").unwrap().unwrap(),
+            &Bytes::from_static(b"str_val")
+        );
+        let hash = db.get_hash("hash_key").unwrap().unwrap();
+        assert_eq!(hash.len(), 2);
+        assert_eq!(
+            hash.get(&Bytes::from_static(b"f1")),
+            Some(&Bytes::from_static(b"v1"))
+        );
+        let list = db.get_list("list_key").unwrap().unwrap();
+        assert_eq!(list.len(), 3);
+        assert_eq!(
+            list.range(0, -1),
+            vec![
+                Bytes::from_static(b"a"),
+                Bytes::from_static(b"b"),
+                Bytes::from_static(b"c"),
+            ]
+        );
     }
 }

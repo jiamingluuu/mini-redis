@@ -18,7 +18,7 @@ pub(crate) const WRONGTYPE: &str =
 /// All WRONGTYPE checking is centralised here — command handlers never build
 /// `Frame::Error(WRONGTYPE…)` directly; they call an accessor and propagate
 /// the `Err(Frame)` it returns.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct Db {
     data: HashMap<String, RedisObject>,
 }
@@ -28,6 +28,18 @@ impl Db {
         Self {
             data: HashMap::new(),
         }
+    }
+
+    /// Iterate over all key-value pairs.
+    ///
+    /// REDIS: Used by RDB serialization to snapshot the entire keyspace.
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (&String, &RedisObject)> {
+        self.data.iter()
+    }
+
+    /// Number of keys in the database.
+    pub(crate) fn len(&self) -> usize {
+        self.data.len()
     }
 
     /// Remove a key, returning `true` if it existed.

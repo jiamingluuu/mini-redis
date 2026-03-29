@@ -15,13 +15,13 @@ use crate::encoding::{LIST_MAX_LISTPACK_ENTRIES, LIST_MAX_LISTPACK_VALUE};
 ///
 /// The two variants are kept distinct so callers can observe (and tests can
 /// assert on) which encoding is active, mirroring OBJECT ENCODING in Redis.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum Encoding {
     Listpack(VecDeque<Bytes>),
     Linked(VecDeque<Bytes>),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct List(Encoding);
 
 impl List {
@@ -90,6 +90,13 @@ impl List {
 
     pub(crate) fn len(&self) -> usize {
         self.deque().len()
+    }
+
+    /// Iterate over elements front-to-back regardless of encoding.
+    ///
+    /// REDIS: Used by RDB serialization to dump all list elements.
+    pub(crate) fn iter(&self) -> impl Iterator<Item = &Bytes> {
+        self.deque().iter()
     }
 
     #[allow(dead_code)]

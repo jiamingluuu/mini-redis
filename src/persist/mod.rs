@@ -1,4 +1,8 @@
 pub(crate) mod aof;
+pub(crate) mod crc64;
+pub(crate) mod rdb;
+
+pub(crate) use rdb::RdbConfig;
 
 use std::path::PathBuf;
 

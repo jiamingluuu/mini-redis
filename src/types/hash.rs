@@ -17,13 +17,13 @@ use crate::encoding::{HASH_MAX_LISTPACK_ENTRIES, HASH_MAX_LISTPACK_VALUE};
 /// byte-packing of the actual listpack format (lp.c).
 ///
 /// Above the threshold Redis promotes to a real hashtable for O(1) access.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum Encoding {
     Listpack(Vec<(Bytes, Bytes)>),
     Table(HashMap<Bytes, Bytes>),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct Hash(Encoding);
 
 impl Hash {
@@ -106,6 +106,18 @@ impl Hash {
         match &self.0 {
             Encoding::Listpack(pairs) => pairs.clone(),
             Encoding::Table(map) => map.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+        }
+    }
+
+    /// Iterate over field-value pairs regardless of encoding.
+    ///
+    /// REDIS: Used by RDB serialization to dump all hash entries without caring
+    /// whether the hash is a listpack or hashtable internally.
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (&Bytes, &Bytes)> {
+        match &self.0 {
+            Encoding::Listpack(pairs) => Box::new(pairs.iter().map(|(k, v)| (k, v)))
+                as Box<dyn Iterator<Item = (&Bytes, &Bytes)>>,
+            Encoding::Table(map) => Box::new(map.iter()),
         }
     }
 

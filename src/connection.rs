@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use bytes::BytesMut;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -16,14 +18,16 @@ pub(crate) struct Connection {
     stream: TcpStream,
     buf: BytesMut,
     store: StoreHandle,
+    rdb_path: PathBuf,
 }
 
 impl Connection {
-    pub(crate) fn new(stream: TcpStream, store: StoreHandle) -> Self {
+    pub(crate) fn new(stream: TcpStream, store: StoreHandle, rdb_path: PathBuf) -> Self {
         Self {
             stream,
             buf: BytesMut::with_capacity(4096),
             store,
+            rdb_path,
         }
     }
 
@@ -76,6 +80,10 @@ impl Connection {
                 Ok(f) => f,
                 Err(_) => Frame::Error("ERR internal error".into()),
             },
+            "BGSAVE" => match self.store.bgsave(self.rdb_path.clone()).await {
+                Ok(f) => f,
+                Err(_) => Frame::Error("ERR internal error".into()),
+            },
             _ => Frame::Error(format!("ERR unknown command '{name}'")),
         }
     }
@@ -89,5 +97,5 @@ impl Connection {
 
 /// Check if a command name is an admin command handled outside the normal pipeline.
 fn is_admin(name: &str) -> bool {
-    matches!(name, "SAVE")
+    matches!(name, "SAVE" | "BGSAVE")
 }
