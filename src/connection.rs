@@ -2,7 +2,7 @@ use bytes::BytesMut;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-use crate::cmd::Command;
+use crate::cmd::{CmdError, Command};
 use crate::resp::{frame::Frame, parser, writer};
 use crate::store::StoreHandle;
 
@@ -58,7 +58,25 @@ impl Connection {
                 Ok(f) => f,
                 Err(_) => Frame::Error("ERR internal error".into()),
             },
+            Err(CmdError::UnknownCommand(ref name)) if is_admin(name) => {
+                self.handle_admin(name).await
+            }
             Err(e) => Frame::Error(e.to_string()),
+        }
+    }
+
+    /// Handle admin commands that don't go through the normal Command pipeline.
+    ///
+    /// REDIS: Commands like SAVE, BGSAVE, CONFIG, etc. are administrative —
+    /// they don't operate on the keyspace via CommandHandler. We route them
+    /// separately to keep Command focused on data operations.
+    async fn handle_admin(&self, name: &str) -> Frame {
+        match name {
+            "SAVE" => match self.store.save().await {
+                Ok(f) => f,
+                Err(_) => Frame::Error("ERR internal error".into()),
+            },
+            _ => Frame::Error(format!("ERR unknown command '{name}'")),
         }
     }
 
@@ -67,4 +85,9 @@ impl Connection {
         writer::encode(frame, &mut out);
         self.stream.write_all(&out).await
     }
+}
+
+/// Check if a command name is an admin command handled outside the normal pipeline.
+fn is_admin(name: &str) -> bool {
+    matches!(name, "SAVE")
 }

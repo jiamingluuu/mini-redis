@@ -1,27 +1,102 @@
 use bytes::Bytes;
 
-use super::{CmdError, CommandHandler, bulk_to_bytes, bulk_to_string};
+use super::{CmdError, CommandHandler, IntoResp, Mutating, bulk_to_bytes, bulk_to_string};
 use crate::db::Db;
 use crate::resp::frame::Frame;
+use crate::resp::writer::frame_to_bytes;
 use crate::types::list::List;
 
-/// List-family commands: LPUSH, RPUSH, LPOP, RPOP, LRANGE, LLEN.
+// ---------------------------------------------------------------------------
+// Read commands: LRANGE, LLEN
+// ---------------------------------------------------------------------------
+
 #[derive(Debug, PartialEq)]
-pub(crate) enum ListCmd {
+pub(crate) enum ListRead {
+    LRange(String, i64, i64),
+    LLen(String),
+}
+
+impl ListRead {
+    pub(crate) fn parse(
+        name: &str,
+        mut args: impl Iterator<Item = Frame>,
+    ) -> Result<Self, CmdError> {
+        match name {
+            "LRANGE" => {
+                let key = bulk_to_string(args.next().ok_or(CmdError::WrongArity("LRANGE"))?)?;
+                let start =
+                    parse_i64(args.next().ok_or(CmdError::WrongArity("LRANGE"))?, "LRANGE")?;
+                let stop = parse_i64(args.next().ok_or(CmdError::WrongArity("LRANGE"))?, "LRANGE")?;
+                Ok(ListRead::LRange(key, start, stop))
+            }
+            "LLEN" => {
+                let key = bulk_to_string(args.next().ok_or(CmdError::WrongArity("LLEN"))?)?;
+                Ok(ListRead::LLen(key))
+            }
+            other => Err(CmdError::UnknownCommand(other.to_string())),
+        }
+    }
+}
+
+impl CommandHandler for ListRead {
+    fn execute(self, db: &mut Db) -> Frame {
+        match self {
+            ListRead::LRange(key, start, stop) => match db.get_list(&key) {
+                Ok(Some(l)) => {
+                    let items = l.range(start, stop);
+                    Frame::Array(items.into_iter().map(Frame::Bulk).collect())
+                }
+                Ok(None) => Frame::Array(vec![]),
+                Err(e) => e,
+            },
+            ListRead::LLen(key) => match db.get_list(&key) {
+                Ok(Some(l)) => Frame::Integer(l.len() as i64),
+                Ok(None) => Frame::Integer(0),
+                Err(e) => e,
+            },
+        }
+    }
+}
+
+impl IntoResp for ListRead {
+    fn to_resp_bytes(&self) -> Bytes {
+        let frame = match self {
+            ListRead::LRange(key, start, stop) => Frame::Array(vec![
+                Frame::Bulk(Bytes::from_static(b"LRANGE")),
+                Frame::Bulk(Bytes::copy_from_slice(key.as_bytes())),
+                Frame::Bulk(Bytes::copy_from_slice(start.to_string().as_bytes())),
+                Frame::Bulk(Bytes::copy_from_slice(stop.to_string().as_bytes())),
+            ]),
+            ListRead::LLen(key) => Frame::Array(vec![
+                Frame::Bulk(Bytes::from_static(b"LLEN")),
+                Frame::Bulk(Bytes::copy_from_slice(key.as_bytes())),
+            ]),
+        };
+        frame_to_bytes(&frame)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Write commands: LPUSH, RPUSH, LPOP, RPOP
+// ---------------------------------------------------------------------------
+
+// REDIS: LPOP/RPOP are writes because they mutate the list by removing elements.
+// Logging them in the AOF ensures the pop is replayed on recovery, maintaining
+// correct list state rather than silently re-inserting popped values.
+#[derive(Debug, PartialEq)]
+pub(crate) enum ListWrite {
     LPush(String, Vec<Bytes>),
     RPush(String, Vec<Bytes>),
     /// (key, optional count) — no count means pop exactly one element.
     LPop(String, Option<u64>),
     RPop(String, Option<u64>),
-    LRange(String, i64, i64),
-    LLen(String),
 }
 
-impl ListCmd {
+impl ListWrite {
     pub(crate) fn parse(
         name: &str,
         mut args: impl Iterator<Item = Frame>,
-    ) -> Result<ListCmd, CmdError> {
+    ) -> Result<Self, CmdError> {
         match name {
             "LPUSH" => {
                 let key = bulk_to_string(args.next().ok_or(CmdError::WrongArity("LPUSH"))?)?;
@@ -30,7 +105,7 @@ impl ListCmd {
                 if values.is_empty() {
                     return Err(CmdError::WrongArity("LPUSH"));
                 }
-                Ok(ListCmd::LPush(key, values))
+                Ok(ListWrite::LPush(key, values))
             }
             "RPUSH" => {
                 let key = bulk_to_string(args.next().ok_or(CmdError::WrongArity("RPUSH"))?)?;
@@ -39,38 +114,27 @@ impl ListCmd {
                 if values.is_empty() {
                     return Err(CmdError::WrongArity("RPUSH"));
                 }
-                Ok(ListCmd::RPush(key, values))
+                Ok(ListWrite::RPush(key, values))
             }
             "LPOP" => {
                 let key = bulk_to_string(args.next().ok_or(CmdError::WrongArity("LPOP"))?)?;
                 let count = parse_optional_count(args.next(), "LPOP")?;
-                Ok(ListCmd::LPop(key, count))
+                Ok(ListWrite::LPop(key, count))
             }
             "RPOP" => {
                 let key = bulk_to_string(args.next().ok_or(CmdError::WrongArity("RPOP"))?)?;
                 let count = parse_optional_count(args.next(), "RPOP")?;
-                Ok(ListCmd::RPop(key, count))
-            }
-            "LRANGE" => {
-                let key = bulk_to_string(args.next().ok_or(CmdError::WrongArity("LRANGE"))?)?;
-                let start =
-                    parse_i64(args.next().ok_or(CmdError::WrongArity("LRANGE"))?, "LRANGE")?;
-                let stop = parse_i64(args.next().ok_or(CmdError::WrongArity("LRANGE"))?, "LRANGE")?;
-                Ok(ListCmd::LRange(key, start, stop))
-            }
-            "LLEN" => {
-                let key = bulk_to_string(args.next().ok_or(CmdError::WrongArity("LLEN"))?)?;
-                Ok(ListCmd::LLen(key))
+                Ok(ListWrite::RPop(key, count))
             }
             other => Err(CmdError::UnknownCommand(other.to_string())),
         }
     }
 }
 
-impl CommandHandler for ListCmd {
+impl CommandHandler for ListWrite {
     fn execute(self, db: &mut Db) -> Frame {
         match self {
-            ListCmd::LPush(key, values) => match db.get_or_insert_list(key) {
+            ListWrite::LPush(key, values) => match db.get_or_insert_list(key) {
                 Ok(l) => {
                     // REDIS: LPUSH pushes values one by one to the head in the
                     // order given, so `LPUSH k a b c` → [c, b, a].
@@ -81,7 +145,7 @@ impl CommandHandler for ListCmd {
                 }
                 Err(e) => e,
             },
-            ListCmd::RPush(key, values) => match db.get_or_insert_list(key) {
+            ListWrite::RPush(key, values) => match db.get_or_insert_list(key) {
                 Ok(l) => {
                     for v in values {
                         l.push_back(v);
@@ -90,32 +154,74 @@ impl CommandHandler for ListCmd {
                 }
                 Err(e) => e,
             },
-            ListCmd::LPop(key, count) => match db.get_list_mut(&key) {
+            ListWrite::LPop(key, count) => match db.get_list_mut(&key) {
                 Ok(Some(l)) => list_pop_response(l, count, true),
                 Ok(None) => Frame::Null,
                 Err(e) => e,
             },
-            ListCmd::RPop(key, count) => match db.get_list_mut(&key) {
+            ListWrite::RPop(key, count) => match db.get_list_mut(&key) {
                 Ok(Some(l)) => list_pop_response(l, count, false),
                 Ok(None) => Frame::Null,
-                Err(e) => e,
-            },
-            ListCmd::LRange(key, start, stop) => match db.get_list(&key) {
-                Ok(Some(l)) => {
-                    let items = l.range(start, stop);
-                    Frame::Array(items.into_iter().map(Frame::Bulk).collect())
-                }
-                Ok(None) => Frame::Array(vec![]),
-                Err(e) => e,
-            },
-            ListCmd::LLen(key) => match db.get_list(&key) {
-                Ok(Some(l)) => Frame::Integer(l.len() as i64),
-                Ok(None) => Frame::Integer(0),
                 Err(e) => e,
             },
         }
     }
 }
+
+impl IntoResp for ListWrite {
+    fn to_resp_bytes(&self) -> Bytes {
+        let frame = match self {
+            ListWrite::LPush(key, values) => {
+                let mut parts = vec![
+                    Frame::Bulk(Bytes::from_static(b"LPUSH")),
+                    Frame::Bulk(Bytes::copy_from_slice(key.as_bytes())),
+                ];
+                parts.extend(values.iter().map(|v| Frame::Bulk(v.clone())));
+                Frame::Array(parts)
+            }
+            ListWrite::RPush(key, values) => {
+                let mut parts = vec![
+                    Frame::Bulk(Bytes::from_static(b"RPUSH")),
+                    Frame::Bulk(Bytes::copy_from_slice(key.as_bytes())),
+                ];
+                parts.extend(values.iter().map(|v| Frame::Bulk(v.clone())));
+                Frame::Array(parts)
+            }
+            ListWrite::LPop(key, count) => {
+                let mut parts = vec![
+                    Frame::Bulk(Bytes::from_static(b"LPOP")),
+                    Frame::Bulk(Bytes::copy_from_slice(key.as_bytes())),
+                ];
+                if let Some(n) = count {
+                    parts.push(Frame::Bulk(Bytes::copy_from_slice(
+                        n.to_string().as_bytes(),
+                    )));
+                }
+                Frame::Array(parts)
+            }
+            ListWrite::RPop(key, count) => {
+                let mut parts = vec![
+                    Frame::Bulk(Bytes::from_static(b"RPOP")),
+                    Frame::Bulk(Bytes::copy_from_slice(key.as_bytes())),
+                ];
+                if let Some(n) = count {
+                    parts.push(Frame::Bulk(Bytes::copy_from_slice(
+                        n.to_string().as_bytes(),
+                    )));
+                }
+                Frame::Array(parts)
+            }
+        };
+        frame_to_bytes(&frame)
+    }
+}
+
+// REDIS: Only write commands mutate state and must be appended to the AOF.
+impl Mutating for ListWrite {}
+
+// ---------------------------------------------------------------------------
+// Shared helpers
+// ---------------------------------------------------------------------------
 
 /// Build the LPOP/RPOP response.
 ///
@@ -168,6 +274,10 @@ fn parse_i64(frame: Frame, cmd: &'static str) -> Result<i64, CmdError> {
         .map_err(|_| CmdError::InvalidArg(cmd, "index must be an integer"))
 }
 
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -198,8 +308,8 @@ mod tests {
     fn lpush_single_value() {
         let (name, args) = cmd(&[b"LPUSH", b"k", b"v"]);
         assert_eq!(
-            ListCmd::parse(&name, args).unwrap(),
-            ListCmd::LPush("k".into(), vec![Bytes::from_static(b"v")])
+            ListWrite::parse(&name, args).unwrap(),
+            ListWrite::LPush("k".into(), vec![Bytes::from_static(b"v")])
         );
     }
 
@@ -207,8 +317,8 @@ mod tests {
     fn lpush_multiple_values() {
         let (name, args) = cmd(&[b"LPUSH", b"k", b"a", b"b", b"c"]);
         assert_eq!(
-            ListCmd::parse(&name, args).unwrap(),
-            ListCmd::LPush(
+            ListWrite::parse(&name, args).unwrap(),
+            ListWrite::LPush(
                 "k".into(),
                 vec![
                     Bytes::from_static(b"a"),
@@ -223,7 +333,7 @@ mod tests {
     fn lpush_no_values_errors() {
         let (name, args) = cmd(&[b"LPUSH", b"k"]);
         assert_eq!(
-            ListCmd::parse(&name, args).unwrap_err(),
+            ListWrite::parse(&name, args).unwrap_err(),
             CmdError::WrongArity("LPUSH")
         );
     }
@@ -232,8 +342,8 @@ mod tests {
     fn rpush_single_value() {
         let (name, args) = cmd(&[b"RPUSH", b"k", b"v"]);
         assert_eq!(
-            ListCmd::parse(&name, args).unwrap(),
-            ListCmd::RPush("k".into(), vec![Bytes::from_static(b"v")])
+            ListWrite::parse(&name, args).unwrap(),
+            ListWrite::RPush("k".into(), vec![Bytes::from_static(b"v")])
         );
     }
 
@@ -241,8 +351,8 @@ mod tests {
     fn lpop_no_count() {
         let (name, args) = cmd(&[b"LPOP", b"k"]);
         assert_eq!(
-            ListCmd::parse(&name, args).unwrap(),
-            ListCmd::LPop("k".into(), None)
+            ListWrite::parse(&name, args).unwrap(),
+            ListWrite::LPop("k".into(), None)
         );
     }
 
@@ -250,8 +360,8 @@ mod tests {
     fn lpop_with_count() {
         let (name, args) = cmd(&[b"LPOP", b"k", b"3"]);
         assert_eq!(
-            ListCmd::parse(&name, args).unwrap(),
-            ListCmd::LPop("k".into(), Some(3))
+            ListWrite::parse(&name, args).unwrap(),
+            ListWrite::LPop("k".into(), Some(3))
         );
     }
 
@@ -259,8 +369,8 @@ mod tests {
     fn rpop_no_count() {
         let (name, args) = cmd(&[b"RPOP", b"k"]);
         assert_eq!(
-            ListCmd::parse(&name, args).unwrap(),
-            ListCmd::RPop("k".into(), None)
+            ListWrite::parse(&name, args).unwrap(),
+            ListWrite::RPop("k".into(), None)
         );
     }
 
@@ -268,8 +378,8 @@ mod tests {
     fn lrange_positive_indices() {
         let (name, args) = cmd(&[b"LRANGE", b"k", b"0", b"5"]);
         assert_eq!(
-            ListCmd::parse(&name, args).unwrap(),
-            ListCmd::LRange("k".into(), 0, 5)
+            ListRead::parse(&name, args).unwrap(),
+            ListRead::LRange("k".into(), 0, 5)
         );
     }
 
@@ -277,8 +387,8 @@ mod tests {
     fn lrange_negative_index() {
         let (name, args) = cmd(&[b"LRANGE", b"k", b"0", b"-1"]);
         assert_eq!(
-            ListCmd::parse(&name, args).unwrap(),
-            ListCmd::LRange("k".into(), 0, -1)
+            ListRead::parse(&name, args).unwrap(),
+            ListRead::LRange("k".into(), 0, -1)
         );
     }
 
@@ -286,8 +396,8 @@ mod tests {
     fn llen_parses_key() {
         let (name, args) = cmd(&[b"LLEN", b"k"]);
         assert_eq!(
-            ListCmd::parse(&name, args).unwrap(),
-            ListCmd::LLen("k".into())
+            ListRead::parse(&name, args).unwrap(),
+            ListRead::LLen("k".into())
         );
     }
 
@@ -296,9 +406,9 @@ mod tests {
     #[test]
     fn lpush_ordering() {
         let mut db = Db::new();
-        ListCmd::LPush("k".into(), vec![b(b"a"), b(b"b"), b(b"c")]).execute(&mut db);
+        ListWrite::LPush("k".into(), vec![b(b"a"), b(b"b"), b(b"c")]).execute(&mut db);
         assert_eq!(
-            ListCmd::LRange("k".into(), 0, -1).execute(&mut db),
+            ListRead::LRange("k".into(), 0, -1).execute(&mut db),
             Frame::Array(vec![
                 Frame::Bulk(b(b"c")),
                 Frame::Bulk(b(b"b")),
@@ -310,9 +420,9 @@ mod tests {
     #[test]
     fn rpush_ordering() {
         let mut db = Db::new();
-        ListCmd::RPush("k".into(), vec![b(b"a"), b(b"b"), b(b"c")]).execute(&mut db);
+        ListWrite::RPush("k".into(), vec![b(b"a"), b(b"b"), b(b"c")]).execute(&mut db);
         assert_eq!(
-            ListCmd::LRange("k".into(), 0, -1).execute(&mut db),
+            ListRead::LRange("k".into(), 0, -1).execute(&mut db),
             Frame::Array(vec![
                 Frame::Bulk(b(b"a")),
                 Frame::Bulk(b(b"b")),
@@ -324,9 +434,9 @@ mod tests {
     #[test]
     fn lpop_no_count_returns_bulk() {
         let mut db = Db::new();
-        ListCmd::LPush("k".into(), vec![b(b"v")]).execute(&mut db);
+        ListWrite::LPush("k".into(), vec![b(b"v")]).execute(&mut db);
         assert_eq!(
-            ListCmd::LPop("k".into(), None).execute(&mut db),
+            ListWrite::LPop("k".into(), None).execute(&mut db),
             Frame::Bulk(b(b"v"))
         );
     }
@@ -334,9 +444,9 @@ mod tests {
     #[test]
     fn rpop_with_count_returns_array() {
         let mut db = Db::new();
-        ListCmd::RPush("k".into(), vec![b(b"a"), b(b"b"), b(b"c")]).execute(&mut db);
+        ListWrite::RPush("k".into(), vec![b(b"a"), b(b"b"), b(b"c")]).execute(&mut db);
         assert_eq!(
-            ListCmd::RPop("k".into(), Some(2)).execute(&mut db),
+            ListWrite::RPop("k".into(), Some(2)).execute(&mut db),
             Frame::Array(vec![Frame::Bulk(b(b"c")), Frame::Bulk(b(b"b"))])
         );
     }
@@ -346,8 +456,31 @@ mod tests {
         let mut db = Db::new();
         db.set("k".into(), RedisObject::Hash(Hash::new()));
         assert_eq!(
-            ListCmd::LPush("k".into(), vec![b(b"v")]).execute(&mut db),
+            ListWrite::LPush("k".into(), vec![b(b"v")]).execute(&mut db),
             Frame::Error(WRONGTYPE.into())
+        );
+    }
+
+    // --- IntoResp round-trip ---
+
+    #[test]
+    fn lpush_serializes_to_resp() {
+        let cmd = ListWrite::LPush(
+            "k".into(),
+            vec![Bytes::from_static(b"a"), Bytes::from_static(b"b")],
+        );
+        assert_eq!(
+            cmd.to_resp_bytes().as_ref(),
+            b"*4\r\n$5\r\nLPUSH\r\n$1\r\nk\r\n$1\r\na\r\n$1\r\nb\r\n"
+        );
+    }
+
+    #[test]
+    fn lpop_with_count_serializes_to_resp() {
+        let cmd = ListWrite::LPop("mylist".into(), Some(3));
+        assert_eq!(
+            cmd.to_resp_bytes().as_ref(),
+            b"*3\r\n$4\r\nLPOP\r\n$6\r\nmylist\r\n$1\r\n3\r\n"
         );
     }
 }

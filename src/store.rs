@@ -1,7 +1,9 @@
 use tokio::sync::{mpsc, oneshot};
 
-use crate::cmd::{Command, CommandHandler};
+use crate::cmd::{Command, CommandHandler, IntoResp};
 use crate::db::Db;
+use crate::persist::FsyncPolicy;
+use crate::persist::aof::Aof;
 use crate::resp::frame::Frame;
 
 // ---------------------------------------------------------------------------
@@ -13,6 +15,8 @@ pub(crate) enum StoreCmd {
         cmd: Command,
         reply: oneshot::Sender<Frame>,
     },
+    /// Trigger an explicit AOF fsync and reply with +OK or an error.
+    Save { reply: oneshot::Sender<Frame> },
 }
 
 // ---------------------------------------------------------------------------
@@ -27,26 +31,100 @@ pub(crate) enum StoreCmd {
 pub(crate) struct Store {
     db: Db,
     rx: mpsc::Receiver<StoreCmd>,
+    aof: Option<Aof>,
 }
 
 impl Store {
-    fn new(rx: mpsc::Receiver<StoreCmd>) -> Self {
-        Self { db: Db::new(), rx }
+    pub(crate) fn new(db: Db, rx: mpsc::Receiver<StoreCmd>, aof: Option<Aof>) -> Self {
+        Self { db, rx, aof }
     }
 
+    /// Run the store actor loop.
+    ///
+    /// Uses `tokio::select!` to multiplex between command processing and a
+    /// periodic fsync tick (when AOF is enabled with `EverySecond` policy).
+    ///
+    /// REDIS: Redis's event loop (ae.c) similarly multiplexes file events
+    /// (client commands) and time events (background tasks like AOF fsync,
+    /// active expiry sampling). Our `select!` models the same pattern.
     pub(crate) async fn run(mut self) {
-        while let Some(msg) = self.rx.recv().await {
-            match msg {
-                StoreCmd::Execute { cmd, reply } => {
-                    let frame = self.execute(cmd);
-                    let _ = reply.send(frame);
+        let needs_tick = self.aof.is_some()
+            && self
+                .aof
+                .as_ref()
+                .is_some_and(|a| a.fsync_policy() == FsyncPolicy::EverySecond);
+
+        if needs_tick {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+            // The first tick fires immediately — skip it.
+            interval.tick().await;
+
+            loop {
+                tokio::select! {
+                    msg = self.rx.recv() => {
+                        match msg {
+                            Some(cmd) => self.handle(cmd),
+                            None => return,
+                        }
+                    }
+                    _ = interval.tick() => {
+                        if let Some(aof) = &mut self.aof
+                            && let Err(e) = aof.fsync()
+                        {
+                            eprintln!("AOF fsync error: {e}");
+                        }
+                    }
                 }
+            }
+        } else {
+            // No periodic fsync needed — simple recv loop (no select overhead).
+            while let Some(msg) = self.rx.recv().await {
+                self.handle(msg);
+            }
+        }
+    }
+
+    fn handle(&mut self, msg: StoreCmd) {
+        match msg {
+            StoreCmd::Execute { cmd, reply } => {
+                let frame = self.execute(cmd);
+                let _ = reply.send(frame);
+            }
+            StoreCmd::Save { reply } => {
+                let frame = match &mut self.aof {
+                    Some(aof) => match aof.fsync() {
+                        Ok(()) => Frame::Simple("OK".into()),
+                        Err(e) => Frame::Error(format!("ERR AOF fsync failed: {e}")),
+                    },
+                    None => Frame::Error("ERR AOF is not enabled".into()),
+                };
+                let _ = reply.send(frame);
             }
         }
     }
 
     fn execute(&mut self, cmd: Command) -> Frame {
-        cmd.execute(&mut self.db)
+        match cmd {
+            Command::Write(w) => {
+                // REDIS: AOF logs the command *after* successful execution.
+                // We serialize the RESP bytes *before* execute() consumes `w`,
+                // since IntoResp::to_resp_bytes takes &self (non-consuming).
+                let resp_bytes = w.to_resp_bytes();
+                let frame = w.execute(&mut self.db);
+
+                // Only log successful mutations — WRONGTYPE errors mean the
+                // command had no effect and should not be replayed.
+                if !matches!(frame, Frame::Error(_))
+                    && let Some(aof) = &mut self.aof
+                    && let Err(e) = aof.append_bytes(&resp_bytes)
+                {
+                    eprintln!("AOF append error: {e}");
+                }
+
+                frame
+            }
+            Command::Read(r) => r.execute(&mut self.db),
+        }
     }
 }
 
@@ -60,9 +138,9 @@ pub(crate) struct StoreHandle {
 }
 
 impl StoreHandle {
-    pub(crate) fn new() -> (Self, Store) {
+    pub(crate) fn new(db: Db, aof: Option<Aof>) -> (Self, Store) {
         let (tx, rx) = mpsc::channel(256);
-        (Self { tx }, Store::new(rx))
+        (Self { tx }, Store::new(db, rx, aof))
     }
 
     pub(crate) async fn execute(&self, cmd: Command) -> anyhow::Result<Frame> {
@@ -72,6 +150,18 @@ impl StoreHandle {
                 cmd,
                 reply: reply_tx,
             })
+            .await
+            .map_err(|_| anyhow::anyhow!("store actor is gone"))?;
+        reply_rx
+            .await
+            .map_err(|_| anyhow::anyhow!("store actor dropped reply"))
+    }
+
+    /// Send a SAVE command to trigger AOF fsync.
+    pub(crate) async fn save(&self) -> anyhow::Result<Frame> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.tx
+            .send(StoreCmd::Save { reply: reply_tx })
             .await
             .map_err(|_| anyhow::anyhow!("store actor is gone"))?;
         reply_rx
@@ -89,11 +179,13 @@ mod tests {
     use bytes::Bytes;
 
     use super::*;
-    use crate::cmd::{HashCmd, ListCmd, StringCmd};
+    use crate::cmd::{
+        HashRead, HashWrite, ListRead, ListWrite, ReadCmd, StringRead, StringWrite, WriteCmd,
+    };
     use crate::db::WRONGTYPE;
 
     async fn spawn() -> StoreHandle {
-        let (h, store) = StoreHandle::new();
+        let (h, store) = StoreHandle::new(Db::new(), None);
         tokio::spawn(store.run());
         h
     }
@@ -108,7 +200,11 @@ mod tests {
     async fn get_missing_returns_null() {
         let h = spawn().await;
         assert_eq!(
-            exec(&h, Command::String(StringCmd::Get("k".into()))).await,
+            exec(
+                &h,
+                Command::Read(ReadCmd::String(StringRead::Get("k".into())))
+            )
+            .await,
             Frame::Null
         );
     }
@@ -118,11 +214,18 @@ mod tests {
         let h = spawn().await;
         exec(
             &h,
-            Command::String(StringCmd::Set("k".into(), Bytes::from_static(b"v"))),
+            Command::Write(WriteCmd::String(StringWrite::Set(
+                "k".into(),
+                Bytes::from_static(b"v"),
+            ))),
         )
         .await;
         assert_eq!(
-            exec(&h, Command::String(StringCmd::Get("k".into()))).await,
+            exec(
+                &h,
+                Command::Read(ReadCmd::String(StringRead::Get("k".into())))
+            )
+            .await,
             Frame::Bulk(Bytes::from_static(b"v"))
         );
     }
@@ -132,18 +235,28 @@ mod tests {
         let h = spawn().await;
         exec(
             &h,
-            Command::String(StringCmd::Set("a".into(), Bytes::from_static(b"1"))),
+            Command::Write(WriteCmd::String(StringWrite::Set(
+                "a".into(),
+                Bytes::from_static(b"1"),
+            ))),
         )
         .await;
         exec(
             &h,
-            Command::String(StringCmd::Set("b".into(), Bytes::from_static(b"2"))),
+            Command::Write(WriteCmd::String(StringWrite::Set(
+                "b".into(),
+                Bytes::from_static(b"2"),
+            ))),
         )
         .await;
         assert_eq!(
             exec(
                 &h,
-                Command::String(StringCmd::Del(vec!["a".into(), "b".into(), "c".into()]))
+                Command::Write(WriteCmd::String(StringWrite::Del(vec![
+                    "a".into(),
+                    "b".into(),
+                    "c".into()
+                ])))
             )
             .await,
             Frame::Integer(2)
@@ -155,14 +268,18 @@ mod tests {
         let h = spawn().await;
         exec(
             &h,
-            Command::Hash(HashCmd::HSet(
+            Command::Write(WriteCmd::Hash(HashWrite::HSet(
                 "k".into(),
                 vec![(Bytes::from_static(b"f"), Bytes::from_static(b"v"))],
-            )),
+            ))),
         )
         .await;
         assert_eq!(
-            exec(&h, Command::String(StringCmd::Get("k".into()))).await,
+            exec(
+                &h,
+                Command::Read(ReadCmd::String(StringRead::Get("k".into())))
+            )
+            .await,
             Frame::Error(WRONGTYPE.into())
         );
     }
@@ -175,13 +292,13 @@ mod tests {
         assert_eq!(
             exec(
                 &h,
-                Command::Hash(HashCmd::HSet(
+                Command::Write(WriteCmd::Hash(HashWrite::HSet(
                     "myhash".into(),
                     vec![
                         (Bytes::from_static(b"f1"), Bytes::from_static(b"v1")),
                         (Bytes::from_static(b"f2"), Bytes::from_static(b"v2")),
                     ]
-                ))
+                )))
             )
             .await,
             Frame::Integer(2)
@@ -193,19 +310,19 @@ mod tests {
         let h = spawn().await;
         exec(
             &h,
-            Command::Hash(HashCmd::HSet(
+            Command::Write(WriteCmd::Hash(HashWrite::HSet(
                 "h".into(),
                 vec![(Bytes::from_static(b"f"), Bytes::from_static(b"v1"))],
-            )),
+            ))),
         )
         .await;
         assert_eq!(
             exec(
                 &h,
-                Command::Hash(HashCmd::HSet(
+                Command::Write(WriteCmd::Hash(HashWrite::HSet(
                     "h".into(),
                     vec![(Bytes::from_static(b"f"), Bytes::from_static(b"v2"))],
-                ))
+                )))
             )
             .await,
             Frame::Integer(0)
@@ -217,16 +334,19 @@ mod tests {
         let h = spawn().await;
         exec(
             &h,
-            Command::Hash(HashCmd::HSet(
+            Command::Write(WriteCmd::Hash(HashWrite::HSet(
                 "h".into(),
                 vec![(Bytes::from_static(b"f"), Bytes::from_static(b"v"))],
-            )),
+            ))),
         )
         .await;
         assert_eq!(
             exec(
                 &h,
-                Command::Hash(HashCmd::HGet("h".into(), Bytes::from_static(b"f")))
+                Command::Read(ReadCmd::Hash(HashRead::HGet(
+                    "h".into(),
+                    Bytes::from_static(b"f")
+                )))
             )
             .await,
             Frame::Bulk(Bytes::from_static(b"v"))
@@ -234,7 +354,10 @@ mod tests {
         assert_eq!(
             exec(
                 &h,
-                Command::Hash(HashCmd::HGet("h".into(), Bytes::from_static(b"missing")))
+                Command::Read(ReadCmd::Hash(HashRead::HGet(
+                    "h".into(),
+                    Bytes::from_static(b"missing")
+                )))
             )
             .await,
             Frame::Null
@@ -246,22 +369,22 @@ mod tests {
         let h = spawn().await;
         exec(
             &h,
-            Command::Hash(HashCmd::HSet(
+            Command::Write(WriteCmd::Hash(HashWrite::HSet(
                 "h".into(),
                 vec![
                     (Bytes::from_static(b"f1"), Bytes::from_static(b"v1")),
                     (Bytes::from_static(b"f2"), Bytes::from_static(b"v2")),
                 ],
-            )),
+            ))),
         )
         .await;
         assert_eq!(
             exec(
                 &h,
-                Command::Hash(HashCmd::HDel(
+                Command::Write(WriteCmd::Hash(HashWrite::HDel(
                     "h".into(),
                     vec![Bytes::from_static(b"f1"), Bytes::from_static(b"nope")]
-                ))
+                )))
             )
             .await,
             Frame::Integer(1)
@@ -273,13 +396,17 @@ mod tests {
         let h = spawn().await;
         exec(
             &h,
-            Command::Hash(HashCmd::HSet(
+            Command::Write(WriteCmd::Hash(HashWrite::HSet(
                 "h".into(),
                 vec![(Bytes::from_static(b"f"), Bytes::from_static(b"v"))],
-            )),
+            ))),
         )
         .await;
-        let frame = exec(&h, Command::Hash(HashCmd::HGetAll("h".into()))).await;
+        let frame = exec(
+            &h,
+            Command::Read(ReadCmd::Hash(HashRead::HGetAll("h".into()))),
+        )
+        .await;
         assert_eq!(
             frame,
             Frame::Array(vec![
@@ -294,20 +421,23 @@ mod tests {
         let h = spawn().await;
         exec(
             &h,
-            Command::Hash(HashCmd::HSet(
+            Command::Write(WriteCmd::Hash(HashWrite::HSet(
                 "h".into(),
                 vec![(Bytes::from_static(b"f"), Bytes::from_static(b"v"))],
-            )),
+            ))),
         )
         .await;
         assert_eq!(
-            exec(&h, Command::Hash(HashCmd::HLen("h".into()))).await,
+            exec(&h, Command::Read(ReadCmd::Hash(HashRead::HLen("h".into())))).await,
             Frame::Integer(1)
         );
         assert_eq!(
             exec(
                 &h,
-                Command::Hash(HashCmd::HExists("h".into(), Bytes::from_static(b"f")))
+                Command::Read(ReadCmd::Hash(HashRead::HExists(
+                    "h".into(),
+                    Bytes::from_static(b"f")
+                )))
             )
             .await,
             Frame::Integer(1)
@@ -315,7 +445,10 @@ mod tests {
         assert_eq!(
             exec(
                 &h,
-                Command::Hash(HashCmd::HExists("h".into(), Bytes::from_static(b"nope")))
+                Command::Read(ReadCmd::Hash(HashRead::HExists(
+                    "h".into(),
+                    Bytes::from_static(b"nope")
+                )))
             )
             .await,
             Frame::Integer(0)
@@ -327,16 +460,19 @@ mod tests {
         let h = spawn().await;
         exec(
             &h,
-            Command::String(StringCmd::Set("k".into(), Bytes::from_static(b"v"))),
+            Command::Write(WriteCmd::String(StringWrite::Set(
+                "k".into(),
+                Bytes::from_static(b"v"),
+            ))),
         )
         .await;
         assert_eq!(
             exec(
                 &h,
-                Command::Hash(HashCmd::HSet(
+                Command::Write(WriteCmd::Hash(HashWrite::HSet(
                     "k".into(),
                     vec![(Bytes::from_static(b"f"), Bytes::from_static(b"v"))],
-                ))
+                )))
             )
             .await,
             Frame::Error(WRONGTYPE.into())
@@ -351,7 +487,10 @@ mod tests {
         assert_eq!(
             exec(
                 &h,
-                Command::List(ListCmd::LPush("k".into(), vec![Bytes::from_static(b"a")]))
+                Command::Write(WriteCmd::List(ListWrite::LPush(
+                    "k".into(),
+                    vec![Bytes::from_static(b"a")]
+                )))
             )
             .await,
             Frame::Integer(1)
@@ -363,18 +502,22 @@ mod tests {
         let h = spawn().await;
         exec(
             &h,
-            Command::List(ListCmd::LPush(
+            Command::Write(WriteCmd::List(ListWrite::LPush(
                 "k".into(),
                 vec![
                     Bytes::from_static(b"a"),
                     Bytes::from_static(b"b"),
                     Bytes::from_static(b"c"),
                 ],
-            )),
+            ))),
         )
         .await;
         assert_eq!(
-            exec(&h, Command::List(ListCmd::LRange("k".into(), 0, -1))).await,
+            exec(
+                &h,
+                Command::Read(ReadCmd::List(ListRead::LRange("k".into(), 0, -1)))
+            )
+            .await,
             Frame::Array(vec![
                 Frame::Bulk(Bytes::from_static(b"c")),
                 Frame::Bulk(Bytes::from_static(b"b")),
@@ -388,18 +531,22 @@ mod tests {
         let h = spawn().await;
         exec(
             &h,
-            Command::List(ListCmd::RPush(
+            Command::Write(WriteCmd::List(ListWrite::RPush(
                 "k".into(),
                 vec![
                     Bytes::from_static(b"a"),
                     Bytes::from_static(b"b"),
                     Bytes::from_static(b"c"),
                 ],
-            )),
+            ))),
         )
         .await;
         assert_eq!(
-            exec(&h, Command::List(ListCmd::LRange("k".into(), 0, -1))).await,
+            exec(
+                &h,
+                Command::Read(ReadCmd::List(ListRead::LRange("k".into(), 0, -1)))
+            )
+            .await,
             Frame::Array(vec![
                 Frame::Bulk(Bytes::from_static(b"a")),
                 Frame::Bulk(Bytes::from_static(b"b")),
@@ -413,11 +560,18 @@ mod tests {
         let h = spawn().await;
         exec(
             &h,
-            Command::List(ListCmd::LPush("k".into(), vec![Bytes::from_static(b"v")])),
+            Command::Write(WriteCmd::List(ListWrite::LPush(
+                "k".into(),
+                vec![Bytes::from_static(b"v")],
+            ))),
         )
         .await;
         assert_eq!(
-            exec(&h, Command::List(ListCmd::LPop("k".into(), None))).await,
+            exec(
+                &h,
+                Command::Write(WriteCmd::List(ListWrite::LPop("k".into(), None)))
+            )
+            .await,
             Frame::Bulk(Bytes::from_static(b"v"))
         );
     }
@@ -427,18 +581,22 @@ mod tests {
         let h = spawn().await;
         exec(
             &h,
-            Command::List(ListCmd::RPush(
+            Command::Write(WriteCmd::List(ListWrite::RPush(
                 "k".into(),
                 vec![
                     Bytes::from_static(b"a"),
                     Bytes::from_static(b"b"),
                     Bytes::from_static(b"c"),
                 ],
-            )),
+            ))),
         )
         .await;
         assert_eq!(
-            exec(&h, Command::List(ListCmd::RPop("k".into(), Some(2)))).await,
+            exec(
+                &h,
+                Command::Write(WriteCmd::List(ListWrite::RPop("k".into(), Some(2))))
+            )
+            .await,
             Frame::Array(vec![
                 Frame::Bulk(Bytes::from_static(b"c")),
                 Frame::Bulk(Bytes::from_static(b"b")),
@@ -451,14 +609,14 @@ mod tests {
         let h = spawn().await;
         exec(
             &h,
-            Command::List(ListCmd::RPush(
+            Command::Write(WriteCmd::List(ListWrite::RPush(
                 "k".into(),
                 vec![Bytes::from_static(b"a"), Bytes::from_static(b"b")],
-            )),
+            ))),
         )
         .await;
         assert_eq!(
-            exec(&h, Command::List(ListCmd::LLen("k".into()))).await,
+            exec(&h, Command::Read(ReadCmd::List(ListRead::LLen("k".into())))).await,
             Frame::Integer(2)
         );
     }
@@ -468,19 +626,280 @@ mod tests {
         let h = spawn().await;
         exec(
             &h,
-            Command::Hash(HashCmd::HSet(
+            Command::Write(WriteCmd::Hash(HashWrite::HSet(
                 "k".into(),
                 vec![(Bytes::from_static(b"f"), Bytes::from_static(b"v"))],
-            )),
+            ))),
         )
         .await;
         assert_eq!(
             exec(
                 &h,
-                Command::List(ListCmd::LPush("k".into(), vec![Bytes::from_static(b"v")]))
+                Command::Write(WriteCmd::List(ListWrite::LPush(
+                    "k".into(),
+                    vec![Bytes::from_static(b"v")]
+                )))
             )
             .await,
             Frame::Error(WRONGTYPE.into())
         );
+    }
+
+    // --- AOF integration ---
+
+    #[tokio::test]
+    async fn write_commands_are_logged_to_aof() {
+        use crate::persist::{AofConfig, FsyncPolicy};
+        use std::io::Read as _;
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        let config = AofConfig {
+            path: path.clone(),
+            fsync: FsyncPolicy::Always,
+            enabled: true,
+        };
+        let aof = Aof::open(&config).unwrap();
+        let (h, store) = StoreHandle::new(Db::new(), Some(aof));
+        tokio::spawn(store.run());
+
+        exec(
+            &h,
+            Command::Write(WriteCmd::String(StringWrite::Set(
+                "k".into(),
+                Bytes::from_static(b"v"),
+            ))),
+        )
+        .await;
+
+        // Read back the AOF file contents
+        let mut contents = Vec::new();
+        std::fs::File::open(&path)
+            .unwrap()
+            .read_to_end(&mut contents)
+            .unwrap();
+        assert_eq!(contents, b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n");
+    }
+
+    #[tokio::test]
+    async fn wrongtype_errors_not_logged() {
+        use crate::persist::{AofConfig, FsyncPolicy};
+        use std::io::Read as _;
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        let config = AofConfig {
+            path: path.clone(),
+            fsync: FsyncPolicy::Always,
+            enabled: true,
+        };
+        let aof = Aof::open(&config).unwrap();
+        let (h, store) = StoreHandle::new(Db::new(), Some(aof));
+        tokio::spawn(store.run());
+
+        // SET a string key
+        exec(
+            &h,
+            Command::Write(WriteCmd::String(StringWrite::Set(
+                "k".into(),
+                Bytes::from_static(b"v"),
+            ))),
+        )
+        .await;
+
+        // Try HSET on string key — should fail with WRONGTYPE
+        let result = exec(
+            &h,
+            Command::Write(WriteCmd::Hash(HashWrite::HSet(
+                "k".into(),
+                vec![(Bytes::from_static(b"f"), Bytes::from_static(b"v"))],
+            ))),
+        )
+        .await;
+        assert!(matches!(result, Frame::Error(_)));
+
+        // AOF should only contain the SET, not the failed HSET
+        let mut contents = Vec::new();
+        std::fs::File::open(&path)
+            .unwrap()
+            .read_to_end(&mut contents)
+            .unwrap();
+        assert_eq!(contents, b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n");
+    }
+
+    #[tokio::test]
+    async fn save_triggers_fsync() {
+        use crate::persist::{AofConfig, FsyncPolicy};
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        let config = AofConfig {
+            path: path.clone(),
+            fsync: FsyncPolicy::No, // No auto-fsync — only explicit SAVE
+            enabled: true,
+        };
+        let aof = Aof::open(&config).unwrap();
+        let (h, store) = StoreHandle::new(Db::new(), Some(aof));
+        tokio::spawn(store.run());
+
+        exec(
+            &h,
+            Command::Write(WriteCmd::String(StringWrite::Set(
+                "k".into(),
+                Bytes::from_static(b"v"),
+            ))),
+        )
+        .await;
+
+        let save_result = h.save().await.unwrap();
+        assert_eq!(save_result, Frame::Simple("OK".into()));
+    }
+
+    #[tokio::test]
+    async fn save_without_aof_returns_error() {
+        let (h, store) = StoreHandle::new(Db::new(), None);
+        tokio::spawn(store.run());
+
+        let result = h.save().await.unwrap();
+        assert!(matches!(result, Frame::Error(_)));
+    }
+
+    // --- Restart integration ---
+
+    /// Simulate: populate store → SAVE → drop store → replay AOF → verify data.
+    ///
+    /// This is the core AOF durability guarantee: after a clean shutdown (or
+    /// crash with fsync=always), replaying the AOF produces the same state.
+    #[tokio::test]
+    async fn aof_restart_preserves_all_data_types() {
+        use crate::persist::{AofConfig, FsyncPolicy};
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        let config = AofConfig {
+            path: path.clone(),
+            fsync: FsyncPolicy::Always,
+            enabled: true,
+        };
+
+        // Phase 1: populate
+        {
+            let aof = Aof::open(&config).unwrap();
+            let (h, store) = StoreHandle::new(Db::new(), Some(aof));
+            tokio::spawn(store.run());
+
+            // String
+            exec(
+                &h,
+                Command::Write(WriteCmd::String(StringWrite::Set(
+                    "str_key".into(),
+                    Bytes::from_static(b"str_val"),
+                ))),
+            )
+            .await;
+
+            // Hash
+            exec(
+                &h,
+                Command::Write(WriteCmd::Hash(HashWrite::HSet(
+                    "hash_key".into(),
+                    vec![
+                        (Bytes::from_static(b"f1"), Bytes::from_static(b"v1")),
+                        (Bytes::from_static(b"f2"), Bytes::from_static(b"v2")),
+                    ],
+                ))),
+            )
+            .await;
+
+            // List
+            exec(
+                &h,
+                Command::Write(WriteCmd::List(ListWrite::RPush(
+                    "list_key".into(),
+                    vec![
+                        Bytes::from_static(b"a"),
+                        Bytes::from_static(b"b"),
+                        Bytes::from_static(b"c"),
+                    ],
+                ))),
+            )
+            .await;
+
+            // SAVE to flush
+            let r = h.save().await.unwrap();
+            assert_eq!(r, Frame::Simple("OK".into()));
+        }
+        // Store is dropped here — simulating shutdown.
+
+        // Phase 2: replay and verify
+        let db = Aof::replay(&path).unwrap();
+
+        // String
+        assert_eq!(
+            db.get_str("str_key").unwrap().unwrap(),
+            &Bytes::from_static(b"str_val")
+        );
+
+        // Hash
+        let hash = db.get_hash("hash_key").unwrap().unwrap();
+        assert_eq!(hash.len(), 2);
+        assert_eq!(
+            hash.get(&Bytes::from_static(b"f1")),
+            Some(&Bytes::from_static(b"v1"))
+        );
+
+        // List
+        let list = db.get_list("list_key").unwrap().unwrap();
+        assert_eq!(list.len(), 3);
+    }
+
+    /// Simulate crash: truncated AOF file still recovers prior commands.
+    #[tokio::test]
+    async fn aof_restart_with_truncated_tail() {
+        use crate::persist::{AofConfig, FsyncPolicy};
+        use std::io::Write as _;
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        let config = AofConfig {
+            path: path.clone(),
+            fsync: FsyncPolicy::Always,
+            enabled: true,
+        };
+
+        // Populate
+        {
+            let aof = Aof::open(&config).unwrap();
+            let (h, store) = StoreHandle::new(Db::new(), Some(aof));
+            tokio::spawn(store.run());
+
+            exec(
+                &h,
+                Command::Write(WriteCmd::String(StringWrite::Set(
+                    "good_key".into(),
+                    Bytes::from_static(b"good_val"),
+                ))),
+            )
+            .await;
+
+            h.save().await.unwrap();
+        }
+
+        // Simulate crash: append partial command
+        {
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            file.write_all(b"*3\r\n$3\r\nSET\r\n$5\r\ncra").unwrap();
+        }
+
+        // Replay — should recover good_key, ignore truncated tail
+        let db = Aof::replay(&path).unwrap();
+        assert_eq!(
+            db.get_str("good_key").unwrap().unwrap(),
+            &Bytes::from_static(b"good_val")
+        );
+        assert_eq!(db.get_str("cra"), Ok(None));
     }
 }

@@ -7,6 +7,13 @@ use super::frame::Frame;
 /// REDIS: Redis encodes replies in addReply* functions in src/networking.c.
 /// We keep encoding and decoding symmetric: the same Frame type goes in and
 /// out, which makes round-trip tests straightforward.
+/// Encode `frame` to a fresh `Bytes` buffer — convenience wrapper around `encode`.
+pub(crate) fn frame_to_bytes(frame: &Frame) -> bytes::Bytes {
+    let mut buf = BytesMut::new();
+    encode(frame, &mut buf);
+    buf.freeze()
+}
+
 pub(crate) fn encode(frame: &Frame, buf: &mut BytesMut) {
     match frame {
         Frame::Simple(s) => {

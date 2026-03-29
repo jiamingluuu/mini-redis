@@ -18,6 +18,7 @@ pub(crate) const WRONGTYPE: &str =
 /// All WRONGTYPE checking is centralised here — command handlers never build
 /// `Frame::Error(WRONGTYPE…)` directly; they call an accessor and propagate
 /// the `Err(Frame)` it returns.
+#[derive(Debug)]
 pub(crate) struct Db {
     data: HashMap<String, RedisObject>,
 }
