@@ -76,7 +76,7 @@ impl Aof {
     pub(crate) fn replay(path: &Path) -> anyhow::Result<Db> {
         let data = std::fs::read(path)?;
         let mut buf = BytesMut::from(data.as_slice());
-        let mut db = Db::new();
+        let mut db = Db::new(crate::eviction::EvictionPolicy::NoEviction);
 
         loop {
             if buf.is_empty() {
@@ -153,7 +153,7 @@ mod tests {
             let config = test_config(&path, FsyncPolicy::Always);
             let mut aof = Aof::open(&config).unwrap();
 
-            let set_cmd = StringWrite::Set("foo".into(), Bytes::from_static(b"bar"));
+            let set_cmd = StringWrite::Set("foo".into(), Bytes::from_static(b"bar"), None);
             aof.append_bytes(&set_cmd.to_resp_bytes()).unwrap();
 
             let hset_cmd = HashWrite::HSet(
@@ -170,7 +170,7 @@ mod tests {
         }
 
         // Replay and verify
-        let db = Aof::replay(&path).unwrap();
+        let mut db = Aof::replay(&path).unwrap();
         assert_eq!(
             db.get_str("foo").unwrap().unwrap(),
             &Bytes::from_static(b"bar")
@@ -182,7 +182,7 @@ mod tests {
     #[test]
     fn replay_empty_file() {
         let tmp = NamedTempFile::new().unwrap();
-        let db = Aof::replay(tmp.path()).unwrap();
+        let mut db = Aof::replay(tmp.path()).unwrap();
         // Empty file → empty Db
         assert_eq!(db.get_str("anything"), Ok(None));
     }
@@ -197,7 +197,7 @@ mod tests {
             let config = test_config(&path, FsyncPolicy::Always);
             let mut aof = Aof::open(&config).unwrap();
 
-            let set_cmd = StringWrite::Set("key".into(), Bytes::from_static(b"val"));
+            let set_cmd = StringWrite::Set("key".into(), Bytes::from_static(b"val"), None);
             aof.append_bytes(&set_cmd.to_resp_bytes()).unwrap();
             aof.fsync().unwrap();
         }
@@ -211,7 +211,7 @@ mod tests {
         }
 
         // Replay should recover the first command and warn about the tail
-        let db = Aof::replay(&path).unwrap();
+        let mut db = Aof::replay(&path).unwrap();
         assert_eq!(
             db.get_str("key").unwrap().unwrap(),
             &Bytes::from_static(b"val")
@@ -230,7 +230,7 @@ mod tests {
             let config = test_config(&path, FsyncPolicy::Always);
             let mut aof = Aof::open(&config).unwrap();
 
-            let set_cmd = StringWrite::Set("ok".into(), Bytes::from_static(b"fine"));
+            let set_cmd = StringWrite::Set("ok".into(), Bytes::from_static(b"fine"), None);
             aof.append_bytes(&set_cmd.to_resp_bytes()).unwrap();
             // Invalid RESP type byte — not +, -, :, $, or *
             aof.append_bytes(b"!garbage\r\n").unwrap();
@@ -250,7 +250,7 @@ mod tests {
         {
             let config = test_config(&path, FsyncPolicy::Always);
             let mut aof = Aof::open(&config).unwrap();
-            let cmd = StringWrite::Set("k".into(), Bytes::from_static(b"v"));
+            let cmd = StringWrite::Set("k".into(), Bytes::from_static(b"v"), None);
             aof.append_bytes(&cmd.to_resp_bytes()).unwrap();
         }
 
@@ -269,7 +269,7 @@ mod tests {
 
         let config = test_config(&path, FsyncPolicy::No);
         let mut aof = Aof::open(&config).unwrap();
-        let cmd = StringWrite::Set("k".into(), Bytes::from_static(b"v"));
+        let cmd = StringWrite::Set("k".into(), Bytes::from_static(b"v"), None);
         // Should succeed without error even with No policy
         aof.append_bytes(&cmd.to_resp_bytes()).unwrap();
         // Explicit fsync should also work

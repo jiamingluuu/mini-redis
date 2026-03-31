@@ -1,3 +1,4 @@
+pub(crate) mod expire;
 pub(crate) mod hash;
 pub(crate) mod list;
 pub(crate) mod string;
@@ -7,6 +8,7 @@ use bytes::Bytes;
 use crate::db::Db;
 use crate::resp::frame::Frame;
 
+pub(crate) use expire::{ExpireRead, ExpireWrite};
 pub(crate) use hash::{HashRead, HashWrite};
 pub(crate) use list::{ListRead, ListWrite};
 pub(crate) use string::{StringRead, StringWrite};
@@ -51,6 +53,7 @@ pub(crate) enum ReadCmd {
     String(StringRead),
     Hash(HashRead),
     List(ListRead),
+    Expire(ExpireRead),
 }
 
 /// All write commands implement `Mutating` so they can be passed to AOF
@@ -60,6 +63,7 @@ pub(crate) enum WriteCmd {
     String(StringWrite),
     Hash(HashWrite),
     List(ListWrite),
+    Expire(ExpireWrite),
 }
 
 /// Top-level command — `Read` vs `Write` is explicit at the type level.
@@ -84,6 +88,7 @@ impl CommandHandler for ReadCmd {
             ReadCmd::String(cmd) => cmd.execute(db),
             ReadCmd::Hash(cmd) => cmd.execute(db),
             ReadCmd::List(cmd) => cmd.execute(db),
+            ReadCmd::Expire(cmd) => cmd.execute(db),
         }
     }
 }
@@ -94,6 +99,7 @@ impl CommandHandler for WriteCmd {
             WriteCmd::String(cmd) => cmd.execute(db),
             WriteCmd::Hash(cmd) => cmd.execute(db),
             WriteCmd::List(cmd) => cmd.execute(db),
+            WriteCmd::Expire(cmd) => cmd.execute(db),
         }
     }
 }
@@ -117,6 +123,7 @@ impl IntoResp for ReadCmd {
             ReadCmd::String(cmd) => cmd.to_resp_bytes(),
             ReadCmd::Hash(cmd) => cmd.to_resp_bytes(),
             ReadCmd::List(cmd) => cmd.to_resp_bytes(),
+            ReadCmd::Expire(cmd) => cmd.to_resp_bytes(),
         }
     }
 }
@@ -127,6 +134,7 @@ impl IntoResp for WriteCmd {
             WriteCmd::String(cmd) => cmd.to_resp_bytes(),
             WriteCmd::Hash(cmd) => cmd.to_resp_bytes(),
             WriteCmd::List(cmd) => cmd.to_resp_bytes(),
+            WriteCmd::Expire(cmd) => cmd.to_resp_bytes(),
         }
     }
 }
@@ -174,6 +182,9 @@ impl Command {
             "LRANGE" | "LLEN" => {
                 ListRead::parse(&name, iter).map(|r| Command::Read(ReadCmd::List(r)))
             }
+            "TTL" | "PTTL" => {
+                ExpireRead::parse(&name, iter).map(|r| Command::Read(ReadCmd::Expire(r)))
+            }
             // ----- writes -----
             "SET" | "DEL" => {
                 StringWrite::parse(&name, iter).map(|w| Command::Write(WriteCmd::String(w)))
@@ -183,6 +194,9 @@ impl Command {
             }
             "LPUSH" | "RPUSH" | "LPOP" | "RPOP" => {
                 ListWrite::parse(&name, iter).map(|w| Command::Write(WriteCmd::List(w)))
+            }
+            "EXPIRE" | "PEXPIRE" | "PERSIST" => {
+                ExpireWrite::parse(&name, iter).map(|w| Command::Write(WriteCmd::Expire(w)))
             }
             other => Err(CmdError::UnknownCommand(other.to_string())),
         }

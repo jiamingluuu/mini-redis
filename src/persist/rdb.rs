@@ -18,6 +18,7 @@ use bytes::Bytes;
 
 use super::crc64::crc64;
 use crate::db::Db;
+use crate::eviction::EvictionPolicy;
 use crate::object::RedisObject;
 use crate::types::hash::Hash;
 use crate::types::list::List;
@@ -29,6 +30,9 @@ use crate::types::list::List;
 const RDB_MAGIC: &[u8] = b"REDIS";
 const RDB_VERSION: &[u8] = b"0009";
 
+const RDB_OPCODE_EXPIRETIME_MS: u8 = 0xFC;
+#[allow(dead_code)]
+const RDB_OPCODE_EXPIRETIME: u8 = 0xFD;
 const RDB_OPCODE_AUX: u8 = 0xFA;
 const RDB_OPCODE_SELECTDB: u8 = 0xFE;
 const RDB_OPCODE_RESIZEDB: u8 = 0xFB;
@@ -79,11 +83,17 @@ pub(crate) fn encode(db: &Db, path: &Path) -> io::Result<()> {
 
     buf.push(RDB_OPCODE_RESIZEDB);
     write_length(&mut buf, db.len() as u64);
-    write_length(&mut buf, 0); // expires size — 0 for now
+    write_length(&mut buf, db.expiry_count() as u64);
 
     // -- Key-value pairs --
-    for (key, obj) in db.iter() {
-        write_key_value(&mut buf, key, obj);
+    // REDIS: rdbSaveKeyValuePair() in rdb.c emits the expiry opcode before
+    // the type+key+value triple when the key has a TTL.
+    for (key, entry) in db.iter() {
+        if let Some(expires_at) = entry.expires_at() {
+            buf.push(RDB_OPCODE_EXPIRETIME_MS);
+            buf.extend_from_slice(&expires_at.to_le_bytes());
+        }
+        write_key_value(&mut buf, key, entry.obj());
     }
 
     // -- EOF + checksum --
@@ -211,14 +221,29 @@ pub(crate) fn decode(path: &Path) -> anyhow::Result<Db> {
         }
     }
 
-    let mut db = Db::new();
+    let mut db = Db::new(EvictionPolicy::NoEviction);
 
     // -- Process opcodes --
+    // REDIS: rdbLoadRio() in rdb.c reads opcodes in a loop. Expiry opcodes
+    // (0xFC for ms, 0xFD for seconds) precede the type+key+value triple.
+    let mut pending_expiry: Option<u64> = None;
+
     loop {
         let opcode = read_byte(&mut cursor)?;
         match opcode {
+            RDB_OPCODE_EXPIRETIME_MS => {
+                // 8-byte little-endian epoch milliseconds
+                let mut ts_buf = [0u8; 8];
+                cursor.read_exact(&mut ts_buf)?;
+                pending_expiry = Some(u64::from_le_bytes(ts_buf));
+            }
+            RDB_OPCODE_EXPIRETIME => {
+                // 4-byte little-endian epoch seconds → convert to ms
+                let mut ts_buf = [0u8; 4];
+                cursor.read_exact(&mut ts_buf)?;
+                pending_expiry = Some(u32::from_le_bytes(ts_buf) as u64 * 1000);
+            }
             RDB_OPCODE_AUX => {
-                // Skip AUX key-value pair — informational only.
                 let _key = read_string(&mut cursor)?;
                 let _val = read_string(&mut cursor)?;
             }
@@ -238,7 +263,8 @@ pub(crate) fn decode(path: &Path) -> anyhow::Result<Db> {
                 let key_str = String::from_utf8(key.to_vec())
                     .map_err(|e| anyhow::anyhow!("non-UTF8 key: {e}"))?;
                 let obj = read_object(type_byte, &mut cursor)?;
-                db.set(key_str, obj);
+                let expiry = pending_expiry.take();
+                db.set_with_expiry(key_str, obj, expiry);
             }
         }
     }
@@ -453,9 +479,9 @@ mod tests {
     fn encode_decode_empty_db() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("test.rdb");
-        let db = Db::new();
+        let db = Db::new(EvictionPolicy::NoEviction);
         encode(&db, &path).unwrap();
-        let loaded = decode(&path).unwrap();
+        let mut loaded = decode(&path).unwrap();
         assert_eq!(loaded.len(), 0);
     }
 
@@ -466,12 +492,12 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("test.rdb");
 
-        let mut db = Db::new();
+        let mut db = Db::new(EvictionPolicy::NoEviction);
         db.set("key1".into(), RedisObject::Str(b("value1")));
         db.set("key2".into(), RedisObject::Str(b("value2")));
 
         encode(&db, &path).unwrap();
-        let loaded = decode(&path).unwrap();
+        let mut loaded = decode(&path).unwrap();
 
         assert_eq!(loaded.len(), 2);
         assert_eq!(loaded.get_str("key1").unwrap().unwrap(), &b("value1"));
@@ -485,14 +511,14 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("test.rdb");
 
-        let mut db = Db::new();
+        let mut db = Db::new(EvictionPolicy::NoEviction);
         let mut hash = Hash::new();
         hash.insert(b("field1"), b("val1"));
         hash.insert(b("field2"), b("val2"));
         db.set("myhash".into(), RedisObject::Hash(hash));
 
         encode(&db, &path).unwrap();
-        let loaded = decode(&path).unwrap();
+        let mut loaded = decode(&path).unwrap();
 
         let h = loaded.get_hash("myhash").unwrap().unwrap();
         assert_eq!(h.len(), 2);
@@ -507,7 +533,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("test.rdb");
 
-        let mut db = Db::new();
+        let mut db = Db::new(EvictionPolicy::NoEviction);
         let mut list = List::new();
         list.push_back(b("a"));
         list.push_back(b("b"));
@@ -515,7 +541,7 @@ mod tests {
         db.set("mylist".into(), RedisObject::List(list));
 
         encode(&db, &path).unwrap();
-        let loaded = decode(&path).unwrap();
+        let mut loaded = decode(&path).unwrap();
 
         let l = loaded.get_list("mylist").unwrap().unwrap();
         assert_eq!(l.len(), 3);
@@ -529,7 +555,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("test.rdb");
 
-        let mut db = Db::new();
+        let mut db = Db::new(EvictionPolicy::NoEviction);
         db.set("s".into(), RedisObject::Str(b("hello")));
 
         let mut hash = Hash::new();
@@ -541,7 +567,7 @@ mod tests {
         db.set("l".into(), RedisObject::List(list));
 
         encode(&db, &path).unwrap();
-        let loaded = decode(&path).unwrap();
+        let mut loaded = decode(&path).unwrap();
 
         assert_eq!(loaded.len(), 3);
         assert_eq!(loaded.get_str("s").unwrap().unwrap(), &b("hello"));
@@ -556,7 +582,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("test.rdb");
 
-        let db = Db::new();
+        let db = Db::new(EvictionPolicy::NoEviction);
         encode(&db, &path).unwrap();
 
         // Corrupt the last byte (part of the CRC64 checksum)
@@ -577,11 +603,11 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("test.rdb");
 
-        let mut db = Db::new();
+        let mut db = Db::new(EvictionPolicy::NoEviction);
         db.set("empty_hash".into(), RedisObject::Hash(Hash::new()));
 
         encode(&db, &path).unwrap();
-        let loaded = decode(&path).unwrap();
+        let mut loaded = decode(&path).unwrap();
         assert_eq!(loaded.get_hash("empty_hash").unwrap().unwrap().len(), 0);
     }
 
@@ -590,11 +616,11 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("test.rdb");
 
-        let mut db = Db::new();
+        let mut db = Db::new(EvictionPolicy::NoEviction);
         db.set("empty_list".into(), RedisObject::List(List::new()));
 
         encode(&db, &path).unwrap();
-        let loaded = decode(&path).unwrap();
+        let mut loaded = decode(&path).unwrap();
         assert_eq!(loaded.get_list("empty_list").unwrap().unwrap().len(), 0);
     }
 
@@ -603,12 +629,78 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("test.rdb");
 
-        let mut db = Db::new();
+        let mut db = Db::new(EvictionPolicy::NoEviction);
         let big = Bytes::from(vec![b'x'; 100_000]);
         db.set("big".into(), RedisObject::Str(big.clone()));
 
         encode(&db, &path).unwrap();
-        let loaded = decode(&path).unwrap();
+        let mut loaded = decode(&path).unwrap();
         assert_eq!(loaded.get_str("big").unwrap().unwrap(), &big);
+    }
+
+    // --- Expiry round-trip ---
+
+    #[test]
+    fn encode_decode_preserves_expiry() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.rdb");
+
+        let mut db = Db::new(EvictionPolicy::NoEviction);
+        let far_future = crate::entry::now_ms() + 3_600_000; // 1 hour from now
+        db.set_with_expiry(
+            "exp_key".into(),
+            RedisObject::Str(b("val")),
+            Some(far_future),
+        );
+        db.set("no_exp".into(), RedisObject::Str(b("val2")));
+
+        encode(&db, &path).unwrap();
+        let loaded = decode(&path).unwrap();
+
+        // Key with expiry: timestamp preserved
+        let loaded_exp = loaded.get_expiry("exp_key");
+        assert_eq!(loaded_exp, Some(Some(far_future)));
+
+        // Key without expiry: no timestamp
+        let loaded_no_exp = loaded.get_expiry("no_exp");
+        assert_eq!(loaded_no_exp, Some(None));
+    }
+
+    #[test]
+    fn encode_decode_expiry_count_in_resizedb() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.rdb");
+
+        let mut db = Db::new(EvictionPolicy::NoEviction);
+        let future = crate::entry::now_ms() + 60_000;
+        db.set_with_expiry("a".into(), RedisObject::Str(b("v")), Some(future));
+        db.set_with_expiry("b".into(), RedisObject::Str(b("v")), Some(future));
+        db.set("c".into(), RedisObject::Str(b("v")));
+
+        assert_eq!(db.expiry_count(), 2);
+
+        encode(&db, &path).unwrap();
+        let loaded = decode(&path).unwrap();
+        assert_eq!(loaded.expiry_count(), 2);
+        assert_eq!(loaded.len(), 3);
+    }
+
+    #[test]
+    fn expired_key_from_rdb_behaves_correctly() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.rdb");
+
+        let mut db = Db::new(EvictionPolicy::NoEviction);
+        // Set expiry in the past
+        db.set_with_expiry("stale".into(), RedisObject::Str(b("old")), Some(1));
+        db.set("fresh".into(), RedisObject::Str(b("new")));
+
+        encode(&db, &path).unwrap();
+        let mut loaded = decode(&path).unwrap();
+
+        // Stale key should be lazily expired on access
+        assert_eq!(loaded.get_str("stale"), Ok(None));
+        // Fresh key should be accessible
+        assert_eq!(loaded.get_str("fresh").unwrap().unwrap(), &b("new"));
     }
 }

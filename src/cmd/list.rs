@@ -405,7 +405,7 @@ mod tests {
 
     #[test]
     fn lpush_ordering() {
-        let mut db = Db::new();
+        let mut db = Db::new(crate::eviction::EvictionPolicy::NoEviction);
         ListWrite::LPush("k".into(), vec![b(b"a"), b(b"b"), b(b"c")]).execute(&mut db);
         assert_eq!(
             ListRead::LRange("k".into(), 0, -1).execute(&mut db),
@@ -419,7 +419,7 @@ mod tests {
 
     #[test]
     fn rpush_ordering() {
-        let mut db = Db::new();
+        let mut db = Db::new(crate::eviction::EvictionPolicy::NoEviction);
         ListWrite::RPush("k".into(), vec![b(b"a"), b(b"b"), b(b"c")]).execute(&mut db);
         assert_eq!(
             ListRead::LRange("k".into(), 0, -1).execute(&mut db),
@@ -433,7 +433,7 @@ mod tests {
 
     #[test]
     fn lpop_no_count_returns_bulk() {
-        let mut db = Db::new();
+        let mut db = Db::new(crate::eviction::EvictionPolicy::NoEviction);
         ListWrite::LPush("k".into(), vec![b(b"v")]).execute(&mut db);
         assert_eq!(
             ListWrite::LPop("k".into(), None).execute(&mut db),
@@ -443,7 +443,7 @@ mod tests {
 
     #[test]
     fn rpop_with_count_returns_array() {
-        let mut db = Db::new();
+        let mut db = Db::new(crate::eviction::EvictionPolicy::NoEviction);
         ListWrite::RPush("k".into(), vec![b(b"a"), b(b"b"), b(b"c")]).execute(&mut db);
         assert_eq!(
             ListWrite::RPop("k".into(), Some(2)).execute(&mut db),
@@ -453,7 +453,7 @@ mod tests {
 
     #[test]
     fn lpush_on_hash_returns_wrongtype() {
-        let mut db = Db::new();
+        let mut db = Db::new(crate::eviction::EvictionPolicy::NoEviction);
         db.set("k".into(), RedisObject::Hash(Hash::new()));
         assert_eq!(
             ListWrite::LPush("k".into(), vec![b(b"v")]).execute(&mut db),

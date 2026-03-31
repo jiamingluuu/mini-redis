@@ -2,6 +2,9 @@ mod cmd;
 mod connection;
 mod db;
 mod encoding;
+mod entry;
+mod eviction;
+mod expiry;
 mod object;
 mod persist;
 mod resp;
@@ -13,6 +16,7 @@ use std::path::PathBuf;
 
 use clap::Parser;
 
+use eviction::{EvictionConfig, EvictionPolicy};
 use persist::aof::Aof;
 use persist::{AofConfig, FsyncPolicy, RdbConfig};
 
@@ -39,6 +43,18 @@ struct Cli {
     /// Path to the RDB snapshot file
     #[arg(long, default_value = "./dump.rdb")]
     rdb_path: PathBuf,
+
+    /// Maximum memory in bytes (0 = no limit)
+    #[arg(long, default_value_t = 0)]
+    maxmemory: usize,
+
+    /// Eviction policy: noeviction, allkeys-lru, allkeys-lfu
+    #[arg(long, default_value = "noeviction")]
+    maxmemory_policy: String,
+
+    /// Number of random keys to sample per eviction round
+    #[arg(long, default_value_t = 5)]
+    maxmemory_samples: usize,
 }
 
 #[tokio::main]
@@ -52,6 +68,22 @@ async fn main() -> anyhow::Result<()> {
         other => anyhow::bail!(
             "invalid appendfsync value '{other}': must be 'always', 'everysec', or 'no'"
         ),
+    };
+
+    let eviction_policy = match cli.maxmemory_policy.as_str() {
+        "noeviction" => EvictionPolicy::NoEviction,
+        "allkeys-lru" => EvictionPolicy::AllKeysLru,
+        "allkeys-lfu" => EvictionPolicy::AllKeysLfu,
+        other => anyhow::bail!(
+            "invalid maxmemory-policy '{other}': must be 'noeviction', 'allkeys-lru', or 'allkeys-lfu'"
+        ),
+    };
+
+    let eviction_config = EvictionConfig {
+        policy: eviction_policy,
+        maxmemory: cli.maxmemory,
+        maxmemory_samples: cli.maxmemory_samples,
+        ..Default::default()
     };
 
     let aof_config = AofConfig {
@@ -86,7 +118,7 @@ async fn main() -> anyhow::Result<()> {
         if rdb_config.enabled {
             eprintln!("RDB enabled, snapshot path {:?}", rdb_config.path);
         }
-        db::Db::new()
+        db::Db::new(eviction_policy)
     };
 
     let aof = if aof_config.enabled {
@@ -99,7 +131,14 @@ async fn main() -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     eprintln!("Listening on {addr}");
 
-    let (store_handle, store) = store::StoreHandle::new(db, aof);
+    if cli.maxmemory > 0 {
+        eprintln!(
+            "maxmemory: {} bytes, policy: {:?}",
+            cli.maxmemory, eviction_policy
+        );
+    }
+
+    let (store_handle, store) = store::StoreHandle::new(db, aof, eviction_config);
     tokio::spawn(store.run());
 
     server::run(listener, store_handle, rdb_config.path).await;

@@ -4,6 +4,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::cmd::{Command, CommandHandler, IntoResp};
 use crate::db::Db;
+use crate::eviction::{self, EvictionConfig};
 use crate::persist::FsyncPolicy;
 use crate::persist::aof::Aof;
 use crate::resp::frame::Frame;
@@ -43,56 +44,79 @@ pub(crate) struct Store {
     db: Db,
     rx: mpsc::Receiver<StoreCmd>,
     aof: Option<Aof>,
+    eviction_config: EvictionConfig,
 }
 
 impl Store {
-    pub(crate) fn new(db: Db, rx: mpsc::Receiver<StoreCmd>, aof: Option<Aof>) -> Self {
-        Self { db, rx, aof }
+    pub(crate) fn new(
+        db: Db,
+        rx: mpsc::Receiver<StoreCmd>,
+        aof: Option<Aof>,
+        eviction_config: EvictionConfig,
+    ) -> Self {
+        Self {
+            db,
+            rx,
+            aof,
+            eviction_config,
+        }
     }
 
     /// Run the store actor loop.
     ///
-    /// Uses `tokio::select!` to multiplex between command processing and a
-    /// periodic fsync tick (when AOF is enabled with `EverySecond` policy).
+    /// Uses `tokio::select!` to multiplex three concerns:
+    /// 1. Client commands (always)
+    /// 2. serverCron tick at 100ms (always — drives active expiry + eviction)
+    /// 3. AOF fsync tick at 1s (only when appendfsync=everysec)
     ///
     /// REDIS: Redis's event loop (ae.c) similarly multiplexes file events
-    /// (client commands) and time events (background tasks like AOF fsync,
-    /// active expiry sampling). Our `select!` models the same pattern.
+    /// (client commands) and time events (serverCron for background tasks
+    /// like active expiry, AOF fsync, replication heartbeats).
     pub(crate) async fn run(mut self) {
-        let needs_tick = self.aof.is_some()
+        let needs_aof_tick = self.aof.is_some()
             && self
                 .aof
                 .as_ref()
                 .is_some_and(|a| a.fsync_policy() == FsyncPolicy::EverySecond);
 
-        if needs_tick {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
-            // The first tick fires immediately — skip it.
-            interval.tick().await;
+        // REDIS: serverCron runs at server.hz (default 10 = every 100ms).
+        let mut cron_interval = tokio::time::interval(std::time::Duration::from_millis(100));
+        cron_interval.tick().await; // skip first immediate tick
 
-            loop {
-                tokio::select! {
-                    msg = self.rx.recv() => {
-                        match msg {
-                            Some(cmd) => self.handle(cmd),
-                            None => return,
-                        }
+        let mut aof_interval = tokio::time::interval(std::time::Duration::from_secs(1));
+        aof_interval.tick().await;
+
+        loop {
+            tokio::select! {
+                msg = self.rx.recv() => {
+                    match msg {
+                        Some(cmd) => self.handle(cmd),
+                        None => return,
                     }
-                    _ = interval.tick() => {
-                        if let Some(aof) = &mut self.aof
-                            && let Err(e) = aof.fsync()
-                        {
-                            eprintln!("AOF fsync error: {e}");
-                        }
+                }
+                _ = cron_interval.tick() => {
+                    self.server_cron();
+                }
+                _ = aof_interval.tick(), if needs_aof_tick => {
+                    if let Some(aof) = &mut self.aof
+                        && let Err(e) = aof.fsync()
+                    {
+                        eprintln!("AOF fsync error: {e}");
                     }
                 }
             }
-        } else {
-            // No periodic fsync needed — simple recv loop (no select overhead).
-            while let Some(msg) = self.rx.recv().await {
-                self.handle(msg);
-            }
         }
+    }
+
+    /// Periodic background work, analogous to Redis's `serverCron()`.
+    ///
+    /// REDIS: serverCron in server.c runs every 100ms and handles:
+    /// - Active expiry sampling (expire.c)
+    /// - Memory eviction checks (evict.c)
+    /// - Replication heartbeats, lazy-free, etc. (not yet implemented)
+    fn server_cron(&mut self) {
+        crate::expiry::active_expire_cycle(&mut self.db);
+        eviction::eviction_cycle(&mut self.db, &self.eviction_config);
     }
 
     fn handle(&mut self, msg: StoreCmd) {
@@ -129,6 +153,15 @@ impl Store {
     fn execute(&mut self, cmd: Command) -> Frame {
         match cmd {
             Command::Write(w) => {
+                // REDIS: processCommand() in server.c calls freeMemoryIfNeeded()
+                // before executing any write command. If we're over maxmemory with
+                // NoEviction policy, reject the write with an OOM error.
+                if !eviction::eviction_cycle(&mut self.db, &self.eviction_config) {
+                    return Frame::Error(
+                        "OOM command not allowed when used memory > 'maxmemory'".into(),
+                    );
+                }
+
                 // REDIS: AOF logs the command *after* successful execution.
                 // We serialize the RESP bytes *before* execute() consumes `w`,
                 // since IntoResp::to_resp_bytes takes &self (non-consuming).
@@ -161,9 +194,9 @@ pub(crate) struct StoreHandle {
 }
 
 impl StoreHandle {
-    pub(crate) fn new(db: Db, aof: Option<Aof>) -> (Self, Store) {
+    pub(crate) fn new(db: Db, aof: Option<Aof>, eviction_config: EvictionConfig) -> (Self, Store) {
         let (tx, rx) = mpsc::channel(256);
-        (Self { tx }, Store::new(db, rx, aof))
+        (Self { tx }, Store::new(db, rx, aof, eviction_config))
     }
 
     pub(crate) async fn execute(&self, cmd: Command) -> anyhow::Result<Frame> {
@@ -223,7 +256,11 @@ mod tests {
     use crate::db::WRONGTYPE;
 
     async fn spawn() -> StoreHandle {
-        let (h, store) = StoreHandle::new(Db::new(), None);
+        let (h, store) = StoreHandle::new(
+            Db::new(crate::eviction::EvictionPolicy::NoEviction),
+            None,
+            EvictionConfig::default(),
+        );
         tokio::spawn(store.run());
         h
     }
@@ -255,6 +292,7 @@ mod tests {
             Command::Write(WriteCmd::String(StringWrite::Set(
                 "k".into(),
                 Bytes::from_static(b"v"),
+                None,
             ))),
         )
         .await;
@@ -276,6 +314,7 @@ mod tests {
             Command::Write(WriteCmd::String(StringWrite::Set(
                 "a".into(),
                 Bytes::from_static(b"1"),
+                None,
             ))),
         )
         .await;
@@ -284,6 +323,7 @@ mod tests {
             Command::Write(WriteCmd::String(StringWrite::Set(
                 "b".into(),
                 Bytes::from_static(b"2"),
+                None,
             ))),
         )
         .await;
@@ -501,6 +541,7 @@ mod tests {
             Command::Write(WriteCmd::String(StringWrite::Set(
                 "k".into(),
                 Bytes::from_static(b"v"),
+                None,
             ))),
         )
         .await;
@@ -698,7 +739,11 @@ mod tests {
             enabled: true,
         };
         let aof = Aof::open(&config).unwrap();
-        let (h, store) = StoreHandle::new(Db::new(), Some(aof));
+        let (h, store) = StoreHandle::new(
+            Db::new(crate::eviction::EvictionPolicy::NoEviction),
+            Some(aof),
+            EvictionConfig::default(),
+        );
         tokio::spawn(store.run());
 
         exec(
@@ -706,6 +751,7 @@ mod tests {
             Command::Write(WriteCmd::String(StringWrite::Set(
                 "k".into(),
                 Bytes::from_static(b"v"),
+                None,
             ))),
         )
         .await;
@@ -732,7 +778,11 @@ mod tests {
             enabled: true,
         };
         let aof = Aof::open(&config).unwrap();
-        let (h, store) = StoreHandle::new(Db::new(), Some(aof));
+        let (h, store) = StoreHandle::new(
+            Db::new(crate::eviction::EvictionPolicy::NoEviction),
+            Some(aof),
+            EvictionConfig::default(),
+        );
         tokio::spawn(store.run());
 
         // SET a string key
@@ -741,6 +791,7 @@ mod tests {
             Command::Write(WriteCmd::String(StringWrite::Set(
                 "k".into(),
                 Bytes::from_static(b"v"),
+                None,
             ))),
         )
         .await;
@@ -777,7 +828,11 @@ mod tests {
             enabled: true,
         };
         let aof = Aof::open(&config).unwrap();
-        let (h, store) = StoreHandle::new(Db::new(), Some(aof));
+        let (h, store) = StoreHandle::new(
+            Db::new(crate::eviction::EvictionPolicy::NoEviction),
+            Some(aof),
+            EvictionConfig::default(),
+        );
         tokio::spawn(store.run());
 
         exec(
@@ -785,6 +840,7 @@ mod tests {
             Command::Write(WriteCmd::String(StringWrite::Set(
                 "k".into(),
                 Bytes::from_static(b"v"),
+                None,
             ))),
         )
         .await;
@@ -795,7 +851,11 @@ mod tests {
 
     #[tokio::test]
     async fn save_without_aof_returns_error() {
-        let (h, store) = StoreHandle::new(Db::new(), None);
+        let (h, store) = StoreHandle::new(
+            Db::new(crate::eviction::EvictionPolicy::NoEviction),
+            None,
+            EvictionConfig::default(),
+        );
         tokio::spawn(store.run());
 
         let result = h.save().await.unwrap();
@@ -823,7 +883,11 @@ mod tests {
         // Phase 1: populate
         {
             let aof = Aof::open(&config).unwrap();
-            let (h, store) = StoreHandle::new(Db::new(), Some(aof));
+            let (h, store) = StoreHandle::new(
+                Db::new(crate::eviction::EvictionPolicy::NoEviction),
+                Some(aof),
+                EvictionConfig::default(),
+            );
             tokio::spawn(store.run());
 
             // String
@@ -832,6 +896,7 @@ mod tests {
                 Command::Write(WriteCmd::String(StringWrite::Set(
                     "str_key".into(),
                     Bytes::from_static(b"str_val"),
+                    None,
                 ))),
             )
             .await;
@@ -870,7 +935,7 @@ mod tests {
         // Store is dropped here — simulating shutdown.
 
         // Phase 2: replay and verify
-        let db = Aof::replay(&path).unwrap();
+        let mut db = Aof::replay(&path).unwrap();
 
         // String
         assert_eq!(
@@ -908,7 +973,11 @@ mod tests {
         // Populate
         {
             let aof = Aof::open(&config).unwrap();
-            let (h, store) = StoreHandle::new(Db::new(), Some(aof));
+            let (h, store) = StoreHandle::new(
+                Db::new(crate::eviction::EvictionPolicy::NoEviction),
+                Some(aof),
+                EvictionConfig::default(),
+            );
             tokio::spawn(store.run());
 
             exec(
@@ -916,6 +985,7 @@ mod tests {
                 Command::Write(WriteCmd::String(StringWrite::Set(
                     "good_key".into(),
                     Bytes::from_static(b"good_val"),
+                    None,
                 ))),
             )
             .await;
@@ -933,7 +1003,7 @@ mod tests {
         }
 
         // Replay — should recover good_key, ignore truncated tail
-        let db = Aof::replay(&path).unwrap();
+        let mut db = Aof::replay(&path).unwrap();
         assert_eq!(
             db.get_str("good_key").unwrap().unwrap(),
             &Bytes::from_static(b"good_val")
@@ -949,7 +1019,11 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let rdb_path = dir.path().join("dump.rdb");
 
-        let (h, store) = StoreHandle::new(Db::new(), None);
+        let (h, store) = StoreHandle::new(
+            Db::new(crate::eviction::EvictionPolicy::NoEviction),
+            None,
+            EvictionConfig::default(),
+        );
         tokio::spawn(store.run());
 
         // String
@@ -958,6 +1032,7 @@ mod tests {
             Command::Write(WriteCmd::String(StringWrite::Set(
                 "str_key".into(),
                 Bytes::from_static(b"str_val"),
+                None,
             ))),
         )
         .await;
@@ -997,7 +1072,7 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         // Decode and verify
-        let db = crate::persist::rdb::decode(&rdb_path).unwrap();
+        let mut db = crate::persist::rdb::decode(&rdb_path).unwrap();
         assert_eq!(
             db.get_str("str_key").unwrap().unwrap(),
             &Bytes::from_static(b"str_val")

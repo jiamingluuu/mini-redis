@@ -344,7 +344,7 @@ mod tests {
 
     #[test]
     fn hset_creates_and_returns_new_count() {
-        let mut db = Db::new();
+        let mut db = Db::new(crate::eviction::EvictionPolicy::NoEviction);
         assert_eq!(
             HashWrite::HSet("h".into(), vec![(b(b"f1"), b(b"v1")), (b(b"f2"), b(b"v2"))])
                 .execute(&mut db),
@@ -354,7 +354,7 @@ mod tests {
 
     #[test]
     fn hset_update_counts_zero_new_fields() {
-        let mut db = Db::new();
+        let mut db = Db::new(crate::eviction::EvictionPolicy::NoEviction);
         HashWrite::HSet("h".into(), vec![(b(b"f"), b(b"v1"))]).execute(&mut db);
         assert_eq!(
             HashWrite::HSet("h".into(), vec![(b(b"f"), b(b"v2"))]).execute(&mut db),
@@ -364,7 +364,7 @@ mod tests {
 
     #[test]
     fn hget_returns_value_or_null() {
-        let mut db = Db::new();
+        let mut db = Db::new(crate::eviction::EvictionPolicy::NoEviction);
         HashWrite::HSet("h".into(), vec![(b(b"f"), b(b"v"))]).execute(&mut db);
         assert_eq!(
             HashRead::HGet("h".into(), b(b"f")).execute(&mut db),
@@ -378,7 +378,7 @@ mod tests {
 
     #[test]
     fn hset_on_string_key_returns_wrongtype() {
-        let mut db = Db::new();
+        let mut db = Db::new(crate::eviction::EvictionPolicy::NoEviction);
         use crate::object::RedisObject;
         db.set("k".into(), RedisObject::Str(b(b"v")));
         assert_eq!(

@@ -2,9 +2,20 @@ use bytes::Bytes;
 
 use super::{CmdError, CommandHandler, IntoResp, Mutating, bulk_to_bytes, bulk_to_string};
 use crate::db::Db;
+use crate::entry;
 use crate::object::RedisObject;
 use crate::resp::frame::Frame;
 use crate::resp::writer::frame_to_bytes;
+
+/// Optional expiry for the SET command.
+///
+/// REDIS: SET supports EX (seconds) and PX (milliseconds) options.
+/// setGenericCommand() in t_string.c handles both.
+#[derive(Debug, PartialEq)]
+pub(crate) enum SetExpiry {
+    Ex(u64), // seconds
+    Px(u64), // milliseconds
+}
 
 // ---------------------------------------------------------------------------
 // Read commands: PING, GET
@@ -74,7 +85,7 @@ impl IntoResp for StringRead {
 
 #[derive(Debug, PartialEq)]
 pub(crate) enum StringWrite {
-    Set(String, Bytes),
+    Set(String, Bytes, Option<SetExpiry>),
     Del(Vec<String>),
 }
 
@@ -87,7 +98,31 @@ impl StringWrite {
             "SET" => {
                 let key = bulk_to_string(args.next().ok_or(CmdError::WrongArity("SET"))?)?;
                 let val = bulk_to_bytes(args.next().ok_or(CmdError::WrongArity("SET"))?)?;
-                Ok(StringWrite::Set(key, val))
+
+                // Parse optional EX/PX arguments
+                // REDIS: SET key value [EX seconds] [PX milliseconds]
+                let expiry = if let Some(opt_frame) = args.next() {
+                    let opt = bulk_to_string(opt_frame)?.to_uppercase();
+                    let dur_frame = args.next().ok_or(CmdError::WrongArity("SET"))?;
+                    let dur_str = bulk_to_string(dur_frame)?;
+                    let dur: u64 = dur_str.parse().map_err(|_| {
+                        CmdError::InvalidArg("SET", "value is not an integer or out of range")
+                    })?;
+                    if dur == 0 {
+                        return Err(CmdError::InvalidArg(
+                            "SET",
+                            "invalid expire time in 'set' command",
+                        ));
+                    }
+                    match opt.as_str() {
+                        "EX" => Some(SetExpiry::Ex(dur)),
+                        "PX" => Some(SetExpiry::Px(dur)),
+                        _ => return Err(CmdError::InvalidArg("SET", "syntax error")),
+                    }
+                } else {
+                    None
+                };
+                Ok(StringWrite::Set(key, val, expiry))
             }
             "DEL" => {
                 let keys: Result<Vec<String>, CmdError> = args.map(bulk_to_string).collect();
@@ -105,10 +140,17 @@ impl StringWrite {
 impl CommandHandler for StringWrite {
     fn execute(self, db: &mut Db) -> Frame {
         match self {
-            StringWrite::Set(key, value) => {
+            StringWrite::Set(key, value, expiry) => {
                 // REDIS: SET always overwrites regardless of existing type.
                 // setGenericCommand() in t_string.c calls dbAdd/dbOverwrite unconditionally.
-                db.set(key, RedisObject::Str(value));
+                let expires_at = expiry.map(|e| {
+                    let now = entry::now_ms();
+                    match e {
+                        SetExpiry::Ex(secs) => now + secs * 1000,
+                        SetExpiry::Px(ms) => now + ms,
+                    }
+                });
+                db.set_with_expiry(key, RedisObject::Str(value), expires_at);
                 Frame::Simple("OK".into())
             }
             StringWrite::Del(keys) => {
@@ -122,11 +164,26 @@ impl CommandHandler for StringWrite {
 impl IntoResp for StringWrite {
     fn to_resp_bytes(&self) -> Bytes {
         let frame = match self {
-            StringWrite::Set(key, value) => Frame::Array(vec![
-                Frame::Bulk(Bytes::from_static(b"SET")),
-                Frame::Bulk(Bytes::copy_from_slice(key.as_bytes())),
-                Frame::Bulk(value.clone()),
-            ]),
+            StringWrite::Set(key, value, expiry) => {
+                let mut parts = vec![
+                    Frame::Bulk(Bytes::from_static(b"SET")),
+                    Frame::Bulk(Bytes::copy_from_slice(key.as_bytes())),
+                    Frame::Bulk(value.clone()),
+                ];
+                // REDIS: AOF must serialize the EX/PX option so replay restores TTLs.
+                match expiry {
+                    Some(SetExpiry::Ex(secs)) => {
+                        parts.push(Frame::Bulk(Bytes::from_static(b"EX")));
+                        parts.push(Frame::Bulk(Bytes::from(secs.to_string())));
+                    }
+                    Some(SetExpiry::Px(ms)) => {
+                        parts.push(Frame::Bulk(Bytes::from_static(b"PX")));
+                        parts.push(Frame::Bulk(Bytes::from(ms.to_string())));
+                    }
+                    None => {}
+                }
+                Frame::Array(parts)
+            }
             StringWrite::Del(keys) => {
                 let mut parts = vec![Frame::Bulk(Bytes::from_static(b"DEL"))];
                 parts.extend(
@@ -207,7 +264,7 @@ mod tests {
         let (name, args) = array_cmd(&[b"SET", b"k", b"v"]);
         assert_eq!(
             StringWrite::parse(&name, args).unwrap(),
-            StringWrite::Set("k".into(), Bytes::from_static(b"v"))
+            StringWrite::Set("k".into(), Bytes::from_static(b"v"), None)
         );
     }
 
@@ -231,9 +288,13 @@ mod tests {
 
     // --- execute ---
 
+    fn new_db() -> Db {
+        Db::new(crate::eviction::EvictionPolicy::NoEviction)
+    }
+
     #[test]
     fn ping_returns_pong() {
-        let mut db = Db::new();
+        let mut db = new_db();
         assert_eq!(
             StringRead::Ping(None).execute(&mut db),
             Frame::Simple("PONG".into())
@@ -242,7 +303,7 @@ mod tests {
 
     #[test]
     fn ping_with_msg_returns_bulk() {
-        let mut db = Db::new();
+        let mut db = new_db();
         assert_eq!(
             StringRead::Ping(Some("hi".into())).execute(&mut db),
             Frame::Bulk(Bytes::from_static(b"hi"))
@@ -251,8 +312,8 @@ mod tests {
 
     #[test]
     fn set_then_get() {
-        let mut db = Db::new();
-        StringWrite::Set("k".into(), Bytes::from_static(b"v")).execute(&mut db);
+        let mut db = new_db();
+        StringWrite::Set("k".into(), Bytes::from_static(b"v"), None).execute(&mut db);
         assert_eq!(
             StringRead::Get("k".into()).execute(&mut db),
             Frame::Bulk(Bytes::from_static(b"v"))
@@ -261,15 +322,15 @@ mod tests {
 
     #[test]
     fn get_missing_returns_null() {
-        let mut db = Db::new();
+        let mut db = new_db();
         assert_eq!(StringRead::Get("k".into()).execute(&mut db), Frame::Null);
     }
 
     #[test]
     fn del_counts_removed_keys() {
-        let mut db = Db::new();
-        StringWrite::Set("a".into(), Bytes::from_static(b"1")).execute(&mut db);
-        StringWrite::Set("b".into(), Bytes::from_static(b"2")).execute(&mut db);
+        let mut db = new_db();
+        StringWrite::Set("a".into(), Bytes::from_static(b"1"), None).execute(&mut db);
+        StringWrite::Set("b".into(), Bytes::from_static(b"2"), None).execute(&mut db);
         assert_eq!(
             StringWrite::Del(vec!["a".into(), "b".into(), "c".into()]).execute(&mut db),
             Frame::Integer(2)
@@ -280,7 +341,7 @@ mod tests {
 
     #[test]
     fn set_serializes_to_resp() {
-        let cmd = StringWrite::Set("foo".into(), Bytes::from_static(b"bar"));
+        let cmd = StringWrite::Set("foo".into(), Bytes::from_static(b"bar"), None);
         assert_eq!(
             cmd.to_resp_bytes().as_ref(),
             b"*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n"
