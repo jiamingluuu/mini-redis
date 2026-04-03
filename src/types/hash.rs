@@ -101,6 +101,28 @@ impl Hash {
         }
     }
 
+    /// Rough size estimate used for maxmemory enforcement.
+    ///
+    /// REDIS: listpack hashes are compact contiguous blobs, while hashtables pay
+    /// substantially more pointer/bucket overhead per entry. We model that
+    /// difference coarsely so encoding promotion is visible to eviction logic.
+    pub(crate) fn estimated_size(&self) -> usize {
+        match &self.0 {
+            Encoding::Listpack(pairs) => {
+                16 + pairs
+                    .iter()
+                    .map(|(k, v)| k.len() + v.len() + 8)
+                    .sum::<usize>()
+            }
+            Encoding::Table(map) => {
+                64 + map
+                    .iter()
+                    .map(|(k, v)| k.len() + v.len() + 64)
+                    .sum::<usize>()
+            }
+        }
+    }
+
     /// Returns all field-value pairs in an unspecified order.
     pub(crate) fn get_all(&self) -> Vec<(Bytes, Bytes)> {
         match &self.0 {
@@ -269,5 +291,19 @@ mod tests {
         assert_eq!(h.get(&b("g")).unwrap(), &b("hello"));
         assert!(h.remove(&b("g")));
         assert_eq!(h.get(&b("g")), None);
+    }
+
+    #[test]
+    fn promotion_changes_estimated_size() {
+        let mut h = Hash::new();
+        h.insert(b("f"), b("v"));
+        let before = h.estimated_size();
+
+        h.insert(
+            Bytes::from(vec![b'x'; HASH_MAX_LISTPACK_VALUE + 1]),
+            Bytes::from_static(b"v"),
+        );
+        assert_eq!(h.encoding_name(), "hashtable");
+        assert!(h.estimated_size() > before);
     }
 }

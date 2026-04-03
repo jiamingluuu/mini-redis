@@ -151,12 +151,7 @@ impl Entry {
     pub(crate) fn estimated_size(&self) -> usize {
         // Entry struct overhead + object size estimate
         let base = std::mem::size_of::<Self>();
-        let obj_size = match &self.obj {
-            RedisObject::Str(b) => b.len(),
-            RedisObject::Hash(h) => h.len() * 64, // rough: 64 bytes per field
-            RedisObject::List(l) => l.len() * 32, // rough: 32 bytes per element
-        };
-        base + obj_size
+        base + self.obj.estimated_size()
     }
 }
 

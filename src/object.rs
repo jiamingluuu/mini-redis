@@ -28,4 +28,12 @@ impl RedisObject {
             RedisObject::List(_) => "list",
         }
     }
+
+    pub(crate) fn estimated_size(&self) -> usize {
+        match self {
+            RedisObject::Str(b) => b.len(),
+            RedisObject::Hash(h) => h.estimated_size(),
+            RedisObject::List(l) => l.estimated_size(),
+        }
+    }
 }

@@ -1,6 +1,8 @@
 use bytes::Bytes;
 
-use super::{CmdError, CommandHandler, IntoResp, Mutating, bulk_to_bytes, bulk_to_string};
+use super::{
+    CmdError, CommandHandler, IntoResp, Mutating, bulk_to_bytes, bulk_to_string, ensure_no_trailing,
+};
 use crate::db::Db;
 use crate::resp::frame::Frame;
 use crate::resp::writer::frame_to_bytes;
@@ -28,19 +30,23 @@ impl HashRead {
             "HGET" => {
                 let key = bulk_to_string(args.next().ok_or(CmdError::WrongArity("HGET"))?)?;
                 let field = bulk_to_bytes(args.next().ok_or(CmdError::WrongArity("HGET"))?)?;
+                ensure_no_trailing(&mut args, "HGET")?;
                 Ok(HashRead::HGet(key, field))
             }
             "HGETALL" => {
                 let key = bulk_to_string(args.next().ok_or(CmdError::WrongArity("HGETALL"))?)?;
+                ensure_no_trailing(&mut args, "HGETALL")?;
                 Ok(HashRead::HGetAll(key))
             }
             "HLEN" => {
                 let key = bulk_to_string(args.next().ok_or(CmdError::WrongArity("HLEN"))?)?;
+                ensure_no_trailing(&mut args, "HLEN")?;
                 Ok(HashRead::HLen(key))
             }
             "HEXISTS" => {
                 let key = bulk_to_string(args.next().ok_or(CmdError::WrongArity("HEXISTS"))?)?;
                 let field = bulk_to_bytes(args.next().ok_or(CmdError::WrongArity("HEXISTS"))?)?;
+                ensure_no_trailing(&mut args, "HEXISTS")?;
                 Ok(HashRead::HExists(key, field))
             }
             other => Err(CmdError::UnknownCommand(other.to_string())),
@@ -159,18 +165,12 @@ impl HashWrite {
 impl CommandHandler for HashWrite {
     fn execute(self, db: &mut Db) -> Frame {
         match self {
-            HashWrite::HSet(key, pairs) => match db.get_or_insert_hash(key) {
-                Ok(h) => {
-                    let added: i64 = pairs.into_iter().map(|(f, v)| h.insert(f, v) as i64).sum();
-                    Frame::Integer(added)
-                }
+            HashWrite::HSet(key, pairs) => match db.hash_upsert_many(key, pairs) {
+                Ok(added) => Frame::Integer(added),
                 Err(e) => e,
             },
-            HashWrite::HDel(key, fields) => match db.get_hash_mut(&key) {
-                Ok(Some(h)) => {
-                    let removed: i64 = fields.iter().map(|f| h.remove(f) as i64).sum();
-                    Frame::Integer(removed)
-                }
+            HashWrite::HDel(key, fields) => match db.hash_remove_many(key, fields) {
+                Ok(Some(removed)) => Frame::Integer(removed),
                 Ok(None) => Frame::Integer(0),
                 Err(e) => e,
             },
@@ -337,6 +337,15 @@ mod tests {
         assert_eq!(
             HashRead::parse(&name, args).unwrap(),
             HashRead::HExists("h".into(), Bytes::from_static(b"f"))
+        );
+    }
+
+    #[test]
+    fn hget_with_extra_arg_errors() {
+        let (name, args) = cmd(&[b"HGET", b"h", b"f", b"extra"]);
+        assert_eq!(
+            HashRead::parse(&name, args).unwrap_err(),
+            CmdError::WrongArity("HGET")
         );
     }
 

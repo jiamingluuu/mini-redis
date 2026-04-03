@@ -1,10 +1,11 @@
 use bytes::Bytes;
 
-use super::{CmdError, CommandHandler, IntoResp, Mutating, bulk_to_bytes, bulk_to_string};
+use super::{
+    CmdError, CommandHandler, IntoResp, Mutating, bulk_to_bytes, bulk_to_string, ensure_no_trailing,
+};
 use crate::db::Db;
 use crate::resp::frame::Frame;
 use crate::resp::writer::frame_to_bytes;
-use crate::types::list::List;
 
 // ---------------------------------------------------------------------------
 // Read commands: LRANGE, LLEN
@@ -27,10 +28,12 @@ impl ListRead {
                 let start =
                     parse_i64(args.next().ok_or(CmdError::WrongArity("LRANGE"))?, "LRANGE")?;
                 let stop = parse_i64(args.next().ok_or(CmdError::WrongArity("LRANGE"))?, "LRANGE")?;
+                ensure_no_trailing(&mut args, "LRANGE")?;
                 Ok(ListRead::LRange(key, start, stop))
             }
             "LLEN" => {
                 let key = bulk_to_string(args.next().ok_or(CmdError::WrongArity("LLEN"))?)?;
+                ensure_no_trailing(&mut args, "LLEN")?;
                 Ok(ListRead::LLen(key))
             }
             other => Err(CmdError::UnknownCommand(other.to_string())),
@@ -119,11 +122,13 @@ impl ListWrite {
             "LPOP" => {
                 let key = bulk_to_string(args.next().ok_or(CmdError::WrongArity("LPOP"))?)?;
                 let count = parse_optional_count(args.next(), "LPOP")?;
+                ensure_no_trailing(&mut args, "LPOP")?;
                 Ok(ListWrite::LPop(key, count))
             }
             "RPOP" => {
                 let key = bulk_to_string(args.next().ok_or(CmdError::WrongArity("RPOP"))?)?;
                 let count = parse_optional_count(args.next(), "RPOP")?;
+                ensure_no_trailing(&mut args, "RPOP")?;
                 Ok(ListWrite::RPop(key, count))
             }
             other => Err(CmdError::UnknownCommand(other.to_string())),
@@ -134,33 +139,21 @@ impl ListWrite {
 impl CommandHandler for ListWrite {
     fn execute(self, db: &mut Db) -> Frame {
         match self {
-            ListWrite::LPush(key, values) => match db.get_or_insert_list(key) {
-                Ok(l) => {
-                    // REDIS: LPUSH pushes values one by one to the head in the
-                    // order given, so `LPUSH k a b c` → [c, b, a].
-                    for v in values {
-                        l.push_front(v);
-                    }
-                    Frame::Integer(l.len() as i64)
-                }
+            ListWrite::LPush(key, values) => match db.list_push_many(key, values, true) {
+                Ok(len) => Frame::Integer(len as i64),
                 Err(e) => e,
             },
-            ListWrite::RPush(key, values) => match db.get_or_insert_list(key) {
-                Ok(l) => {
-                    for v in values {
-                        l.push_back(v);
-                    }
-                    Frame::Integer(l.len() as i64)
-                }
+            ListWrite::RPush(key, values) => match db.list_push_many(key, values, false) {
+                Ok(len) => Frame::Integer(len as i64),
                 Err(e) => e,
             },
-            ListWrite::LPop(key, count) => match db.get_list_mut(&key) {
-                Ok(Some(l)) => list_pop_response(l, count, true),
+            ListWrite::LPop(key, count) => match db.list_pop_many(key, count, true) {
+                Ok(Some(values)) => list_pop_response(values, count),
                 Ok(None) => Frame::Null,
                 Err(e) => e,
             },
-            ListWrite::RPop(key, count) => match db.get_list_mut(&key) {
-                Ok(Some(l)) => list_pop_response(l, count, false),
+            ListWrite::RPop(key, count) => match db.list_pop_many(key, count, false) {
+                Ok(Some(values)) => list_pop_response(values, count),
                 Ok(None) => Frame::Null,
                 Err(e) => e,
             },
@@ -227,31 +220,10 @@ impl Mutating for ListWrite {}
 ///
 /// - No count: return a single Bulk (or Null if empty).
 /// - With count: return an Array of up to `count` elements (or empty Array if list is empty).
-fn list_pop_response(list: &mut List, count: Option<u64>, from_front: bool) -> Frame {
+fn list_pop_response(values: Vec<Bytes>, count: Option<u64>) -> Frame {
     match count {
-        None => {
-            let val = if from_front {
-                list.pop_front()
-            } else {
-                list.pop_back()
-            };
-            val.map_or(Frame::Null, Frame::Bulk)
-        }
-        Some(n) => {
-            let mut out = Vec::with_capacity(n as usize);
-            for _ in 0..n {
-                let val = if from_front {
-                    list.pop_front()
-                } else {
-                    list.pop_back()
-                };
-                match val {
-                    Some(v) => out.push(Frame::Bulk(v)),
-                    None => break,
-                }
-            }
-            Frame::Array(out)
-        }
+        None => values.into_iter().next().map_or(Frame::Null, Frame::Bulk),
+        Some(_) => Frame::Array(values.into_iter().map(Frame::Bulk).collect()),
     }
 }
 
@@ -398,6 +370,24 @@ mod tests {
         assert_eq!(
             ListRead::parse(&name, args).unwrap(),
             ListRead::LLen("k".into())
+        );
+    }
+
+    #[test]
+    fn llen_with_extra_arg_errors() {
+        let (name, args) = cmd(&[b"LLEN", b"k", b"extra"]);
+        assert_eq!(
+            ListRead::parse(&name, args).unwrap_err(),
+            CmdError::WrongArity("LLEN")
+        );
+    }
+
+    #[test]
+    fn lpop_with_extra_arg_errors() {
+        let (name, args) = cmd(&[b"LPOP", b"k", b"1", b"extra"]);
+        assert_eq!(
+            ListWrite::parse(&name, args).unwrap_err(),
+            CmdError::WrongArity("LPOP")
         );
     }
 

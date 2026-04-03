@@ -44,6 +44,7 @@ pub(crate) struct Store {
     db: Db,
     rx: mpsc::Receiver<StoreCmd>,
     aof: Option<Aof>,
+    aof_error: Option<String>,
     eviction_config: EvictionConfig,
 }
 
@@ -58,6 +59,7 @@ impl Store {
             db,
             rx,
             aof,
+            aof_error: None,
             eviction_config,
         }
     }
@@ -101,7 +103,7 @@ impl Store {
                     if let Some(aof) = &mut self.aof
                         && let Err(e) = aof.fsync()
                     {
-                        eprintln!("AOF fsync error: {e}");
+                        self.record_aof_error(format!("AOF fsync failed: {e}"));
                     }
                 }
             }
@@ -126,12 +128,20 @@ impl Store {
                 let _ = reply.send(frame);
             }
             StoreCmd::Save { reply } => {
-                let frame = match &mut self.aof {
-                    Some(aof) => match aof.fsync() {
-                        Ok(()) => Frame::Simple("OK".into()),
-                        Err(e) => Frame::Error(format!("ERR AOF fsync failed: {e}")),
-                    },
-                    None => Frame::Error("ERR AOF is not enabled".into()),
+                let frame = if let Some(frame) = self.aof_misconf_frame() {
+                    frame
+                } else {
+                    match &mut self.aof {
+                        Some(aof) => match aof.fsync() {
+                            Ok(()) => Frame::Simple("OK".into()),
+                            Err(e) => {
+                                self.record_aof_error(format!("AOF fsync failed: {e}"));
+                                self.aof_misconf_frame()
+                                    .expect("latched AOF error should produce a reply")
+                            }
+                        },
+                        None => Frame::Error("ERR AOF is not enabled".into()),
+                    }
                 };
                 let _ = reply.send(frame);
             }
@@ -153,6 +163,10 @@ impl Store {
     fn execute(&mut self, cmd: Command) -> Frame {
         match cmd {
             Command::Write(w) => {
+                if let Some(frame) = self.aof_misconf_frame() {
+                    return frame;
+                }
+
                 // REDIS: processCommand() in server.c calls freeMemoryIfNeeded()
                 // before executing any write command. If we're over maxmemory with
                 // NoEviction policy, reject the write with an OOM error.
@@ -174,13 +188,30 @@ impl Store {
                     && let Some(aof) = &mut self.aof
                     && let Err(e) = aof.append_bytes(&resp_bytes)
                 {
-                    eprintln!("AOF append error: {e}");
+                    self.record_aof_error(format!("AOF append failed: {e}"));
+                    return self
+                        .aof_misconf_frame()
+                        .expect("latched AOF error should produce a reply");
                 }
 
                 frame
             }
             Command::Read(r) => r.execute(&mut self.db),
         }
+    }
+
+    fn record_aof_error(&mut self, message: String) {
+        if self.aof_error.is_none() {
+            self.aof_error = Some(message);
+        }
+    }
+
+    fn aof_misconf_frame(&self) -> Option<Frame> {
+        self.aof_error.as_ref().map(|message| {
+            Frame::Error(format!(
+                "MISCONF AOF writes are disabled because persistence failed: {message}"
+            ))
+        })
     }
 }
 
@@ -248,17 +279,57 @@ impl StoreHandle {
 #[cfg(test)]
 mod tests {
     use bytes::Bytes;
+    use std::io;
 
     use super::*;
     use crate::cmd::{
         HashRead, HashWrite, ListRead, ListWrite, ReadCmd, StringRead, StringWrite, WriteCmd,
     };
     use crate::db::WRONGTYPE;
+    use crate::persist::FsyncPolicy;
+    use crate::persist::aof::AofWriter;
+
+    struct FailingWriter {
+        fail_writes: bool,
+        fail_sync: bool,
+    }
+
+    impl AofWriter for FailingWriter {
+        fn write_all(&mut self, _bytes: &[u8]) -> io::Result<()> {
+            if self.fail_writes {
+                Err(io::Error::other("simulated append failure"))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn sync_all(&mut self) -> io::Result<()> {
+            if self.fail_sync {
+                Err(io::Error::other("simulated fsync failure"))
+            } else {
+                Ok(())
+            }
+        }
+    }
 
     async fn spawn() -> StoreHandle {
         let (h, store) = StoreHandle::new(
             Db::new(crate::eviction::EvictionPolicy::NoEviction),
             None,
+            EvictionConfig::default(),
+        );
+        tokio::spawn(store.run());
+        h
+    }
+
+    async fn spawn_with_aof(aof: Aof) -> StoreHandle {
+        let (h, store) = StoreHandle::new(
+            Db::new(crate::eviction::EvictionPolicy::NoEviction),
+            Some(aof),
             EvictionConfig::default(),
         );
         tokio::spawn(store.run());
@@ -1093,5 +1164,64 @@ mod tests {
                 Bytes::from_static(b"c"),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn aof_append_failure_returns_misconf_and_latches() {
+        let aof = Aof::from_writer(
+            Box::new(FailingWriter {
+                fail_writes: true,
+                fail_sync: false,
+            }),
+            FsyncPolicy::No,
+        );
+        let h = spawn_with_aof(aof).await;
+
+        let first = exec(
+            &h,
+            Command::Write(WriteCmd::String(StringWrite::Set(
+                "k".into(),
+                Bytes::from_static(b"v"),
+                None,
+            ))),
+        )
+        .await;
+        assert!(matches!(first, Frame::Error(ref msg) if msg.contains("MISCONF")));
+
+        let second = exec(
+            &h,
+            Command::Write(WriteCmd::String(StringWrite::Set(
+                "other".into(),
+                Bytes::from_static(b"v"),
+                None,
+            ))),
+        )
+        .await;
+        assert!(matches!(second, Frame::Error(ref msg) if msg.contains("MISCONF")));
+    }
+
+    #[tokio::test]
+    async fn periodic_aof_fsync_failure_latches_misconf() {
+        let aof = Aof::from_writer(
+            Box::new(FailingWriter {
+                fail_writes: false,
+                fail_sync: true,
+            }),
+            FsyncPolicy::EverySecond,
+        );
+        let h = spawn_with_aof(aof).await;
+
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+
+        let result = exec(
+            &h,
+            Command::Write(WriteCmd::String(StringWrite::Set(
+                "k".into(),
+                Bytes::from_static(b"v"),
+                None,
+            ))),
+        )
+        .await;
+        assert!(matches!(result, Frame::Error(ref msg) if msg.contains("MISCONF")));
     }
 }

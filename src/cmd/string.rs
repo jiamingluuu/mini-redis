@@ -1,6 +1,8 @@
 use bytes::Bytes;
 
-use super::{CmdError, CommandHandler, IntoResp, Mutating, bulk_to_bytes, bulk_to_string};
+use super::{
+    CmdError, CommandHandler, IntoResp, Mutating, bulk_to_bytes, bulk_to_string, ensure_no_trailing,
+};
 use crate::db::Db;
 use crate::entry;
 use crate::object::RedisObject;
@@ -35,10 +37,12 @@ impl StringRead {
         match name {
             "PING" => {
                 let msg = args.next().map(bulk_to_string).transpose()?;
+                ensure_no_trailing(&mut args, "PING")?;
                 Ok(StringRead::Ping(msg))
             }
             "GET" => {
                 let key = bulk_to_string(args.next().ok_or(CmdError::WrongArity("GET"))?)?;
+                ensure_no_trailing(&mut args, "GET")?;
                 Ok(StringRead::Get(key))
             }
             other => Err(CmdError::UnknownCommand(other.to_string())),
@@ -122,6 +126,7 @@ impl StringWrite {
                 } else {
                     None
                 };
+                ensure_no_trailing(&mut args, "SET")?;
                 Ok(StringWrite::Set(key, val, expiry))
             }
             "DEL" => {
@@ -283,6 +288,24 @@ mod tests {
         assert_eq!(
             StringWrite::parse(&name, args).unwrap_err(),
             CmdError::WrongArity("DEL")
+        );
+    }
+
+    #[test]
+    fn get_with_extra_args_errors() {
+        let (name, args) = array_cmd(&[b"GET", b"k", b"extra"]);
+        assert_eq!(
+            StringRead::parse(&name, args).unwrap_err(),
+            CmdError::WrongArity("GET")
+        );
+    }
+
+    #[test]
+    fn set_with_trailing_arg_errors() {
+        let (name, args) = array_cmd(&[b"SET", b"k", b"v", b"EX", b"10", b"junk"]);
+        assert_eq!(
+            StringWrite::parse(&name, args).unwrap_err(),
+            CmdError::WrongArity("SET")
         );
     }
 

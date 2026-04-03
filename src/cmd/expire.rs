@@ -6,7 +6,7 @@
 
 use bytes::Bytes;
 
-use super::{CmdError, CommandHandler, IntoResp, Mutating, bulk_to_string};
+use super::{CmdError, CommandHandler, IntoResp, Mutating, bulk_to_string, ensure_no_trailing};
 use crate::db::Db;
 use crate::entry;
 use crate::resp::frame::Frame;
@@ -35,6 +35,7 @@ impl ExpireRead {
             _ => return Err(CmdError::UnknownCommand(name.to_string())),
         };
         let key = bulk_to_string(args.next().ok_or(CmdError::WrongArity(cmd_name))?)?;
+        ensure_no_trailing(&mut args, cmd_name)?;
         match cmd_name {
             "TTL" => Ok(ExpireRead::Ttl(key)),
             _ => Ok(ExpireRead::Pttl(key)),
@@ -121,6 +122,7 @@ impl ExpireWrite {
                 };
                 let key = bulk_to_string(args.next().ok_or(CmdError::WrongArity(cmd_name))?)?;
                 let dur_str = bulk_to_string(args.next().ok_or(CmdError::WrongArity(cmd_name))?)?;
+                ensure_no_trailing(&mut args, cmd_name)?;
                 let dur: u64 = dur_str.parse().map_err(|_| {
                     CmdError::InvalidArg(cmd_name, "value is not an integer or out of range")
                 })?;
@@ -132,6 +134,7 @@ impl ExpireWrite {
             }
             "PERSIST" => {
                 let key = bulk_to_string(args.next().ok_or(CmdError::WrongArity("PERSIST"))?)?;
+                ensure_no_trailing(&mut args, "PERSIST")?;
                 Ok(ExpireWrite::Persist(key))
             }
             other => Err(CmdError::UnknownCommand(other.to_string())),
@@ -264,6 +267,24 @@ mod tests {
         assert_eq!(
             ExpireWrite::parse(&name, args).unwrap(),
             ExpireWrite::Persist("k".into())
+        );
+    }
+
+    #[test]
+    fn ttl_with_extra_arg_errors() {
+        let (name, args) = array_cmd(&[b"TTL", b"k", b"extra"]);
+        assert_eq!(
+            ExpireRead::parse(&name, args).unwrap_err(),
+            CmdError::WrongArity("TTL")
+        );
+    }
+
+    #[test]
+    fn expire_with_extra_arg_errors() {
+        let (name, args) = array_cmd(&[b"EXPIRE", b"k", b"60", b"extra"]);
+        assert_eq!(
+            ExpireWrite::parse(&name, args).unwrap_err(),
+            CmdError::WrongArity("EXPIRE")
         );
     }
 

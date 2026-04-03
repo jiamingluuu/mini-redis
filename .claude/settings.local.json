@@ -5,7 +5,8 @@
       "Bash(cargo clippy:*)",
       "Bash(cargo:*)",
       "WebSearch",
-      "Bash(perl:*)"
+      "Bash(perl:*)",
+      "Bash(find:*)"
     ]
   }
 }

@@ -242,6 +242,17 @@ pub(crate) fn bulk_to_bytes(frame: Frame) -> Result<Bytes, CmdError> {
     }
 }
 
+pub(crate) fn ensure_no_trailing(
+    args: &mut impl Iterator<Item = Frame>,
+    cmd: &'static str,
+) -> Result<(), CmdError> {
+    if args.next().is_some() {
+        Err(CmdError::WrongArity(cmd))
+    } else {
+        Ok(())
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests — dispatch-level: verify from_frame routes to the right variant
 // ---------------------------------------------------------------------------

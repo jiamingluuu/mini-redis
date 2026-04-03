@@ -9,6 +9,26 @@ use crate::cmd::{Command, CommandHandler};
 use crate::db::Db;
 use crate::resp::parser;
 
+pub(crate) trait AofWriter: Send {
+    fn write_all(&mut self, bytes: &[u8]) -> io::Result<()>;
+    fn flush(&mut self) -> io::Result<()>;
+    fn sync_all(&mut self) -> io::Result<()>;
+}
+
+impl AofWriter for BufWriter<File> {
+    fn write_all(&mut self, bytes: &[u8]) -> io::Result<()> {
+        Write::write_all(self, bytes)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Write::flush(self)
+    }
+
+    fn sync_all(&mut self) -> io::Result<()> {
+        self.get_ref().sync_all()
+    }
+}
+
 /// Append-Only File writer.
 ///
 /// REDIS: The AOF (appendonly.c) logs every mutation as the RESP command that
@@ -20,7 +40,7 @@ use crate::resp::parser;
 /// would add task-switching overhead for no benefit here — the same design
 /// choice Redis makes in appendonly.c.
 pub(crate) struct Aof {
-    writer: BufWriter<File>,
+    writer: Box<dyn AofWriter>,
     fsync_policy: FsyncPolicy,
 }
 
@@ -36,9 +56,17 @@ impl Aof {
             .append(true)
             .open(&config.path)?;
         Ok(Self {
-            writer: BufWriter::new(file),
+            writer: Box::new(BufWriter::new(file)),
             fsync_policy: config.fsync,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_writer(writer: Box<dyn AofWriter>, fsync_policy: FsyncPolicy) -> Self {
+        Self {
+            writer,
+            fsync_policy,
+        }
     }
 
     /// Append raw RESP bytes to the AOF file.
@@ -61,7 +89,7 @@ impl Aof {
     /// (also syncs metadata) but correct and portable.
     pub(crate) fn fsync(&mut self) -> io::Result<()> {
         self.writer.flush()?;
-        self.writer.get_ref().sync_all()
+        self.writer.sync_all()
     }
 
     /// Replay an AOF file to reconstruct the database state.
@@ -274,5 +302,27 @@ mod tests {
         aof.append_bytes(&cmd.to_resp_bytes()).unwrap();
         // Explicit fsync should also work
         aof.fsync().unwrap();
+    }
+
+    #[test]
+    fn replayed_db_can_adopt_runtime_eviction_policy() {
+        let tmp = NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+
+        {
+            let config = test_config(&path, FsyncPolicy::Always);
+            let mut aof = Aof::open(&config).unwrap();
+            let cmd = StringWrite::Set("k".into(), Bytes::from_static(b"v"), None);
+            aof.append_bytes(&cmd.to_resp_bytes()).unwrap();
+        }
+
+        let mut db = Aof::replay(&path).unwrap();
+        db.set_eviction_policy(crate::eviction::EvictionPolicy::AllKeysLru);
+
+        let before = db.get_entry("k").unwrap().lru_clock();
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        assert_eq!(db.get_str("k"), Ok(Some(&Bytes::from_static(b"v"))));
+        let after = db.get_entry("k").unwrap().lru_clock();
+        assert!(after > before, "expected LRU clock to update after access");
     }
 }

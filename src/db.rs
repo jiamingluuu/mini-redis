@@ -41,6 +41,10 @@ impl Db {
         }
     }
 
+    pub(crate) fn set_eviction_policy(&mut self, eviction_policy: EvictionPolicy) {
+        self.eviction_policy = eviction_policy;
+    }
+
     // -----------------------------------------------------------------------
     // Metadata accessors
     // -----------------------------------------------------------------------
@@ -235,6 +239,7 @@ impl Db {
     }
 
     /// Return an exclusive reference to a hash (for mutations like HDEL).
+    #[cfg(test)]
     pub(crate) fn get_hash_mut(&mut self, key: &str) -> Result<Option<&mut Hash>, Frame> {
         self.expire_if_needed(key);
         self.touch(key);
@@ -256,20 +261,10 @@ impl Db {
         }
     }
 
-    /// Return an exclusive reference to a list (for mutations like LPOP).
-    pub(crate) fn get_list_mut(&mut self, key: &str) -> Result<Option<&mut List>, Frame> {
-        self.expire_if_needed(key);
-        self.touch(key);
-        match self.data.get_mut(key).map(|e| e.obj_mut()) {
-            Some(RedisObject::List(l)) => Ok(Some(l)),
-            Some(_) => Err(Frame::Error(WRONGTYPE.into())),
-            None => Ok(None),
-        }
-    }
-
     /// Return (or create) a mutable hash for the given key.
     ///
     /// Returns `Err(Frame)` if the key already holds a non-Hash type.
+    #[cfg(test)]
     pub(crate) fn get_or_insert_hash(&mut self, key: String) -> Result<&mut Hash, Frame> {
         self.expire_if_needed(&key);
         self.touch(&key);
@@ -286,6 +281,7 @@ impl Db {
     /// Return (or create) a mutable list for the given key.
     ///
     /// Returns `Err(Frame)` if the key already holds a non-List type.
+    #[cfg(test)]
     pub(crate) fn get_or_insert_list(&mut self, key: String) -> Result<&mut List, Frame> {
         self.expire_if_needed(&key);
         self.touch(&key);
@@ -299,10 +295,171 @@ impl Db {
         }
     }
 
+    pub(crate) fn hash_upsert_many(
+        &mut self,
+        key: String,
+        pairs: Vec<(Bytes, Bytes)>,
+    ) -> Result<i64, Frame> {
+        self.expire_if_needed(&key);
+        self.touch(&key);
+        if !self.data.contains_key(&key) {
+            self.set(key.clone(), RedisObject::Hash(Hash::new()));
+        }
+
+        let (added, before_size, after_size) = {
+            let entry = self.data.get_mut(&key).expect("key exists after insertion");
+            match entry.obj_mut() {
+                RedisObject::Hash(hash) => {
+                    let before_size = hash.estimated_size();
+                    let added = pairs
+                        .into_iter()
+                        .map(|(field, value)| hash.insert(field, value) as i64)
+                        .sum();
+                    let after_size = hash.estimated_size();
+                    (added, before_size, after_size)
+                }
+                _ => return Err(Frame::Error(WRONGTYPE.into())),
+            }
+        };
+
+        self.apply_size_delta(before_size, after_size);
+        Ok(added)
+    }
+
+    pub(crate) fn hash_remove_many(
+        &mut self,
+        key: String,
+        fields: Vec<Bytes>,
+    ) -> Result<Option<i64>, Frame> {
+        self.expire_if_needed(&key);
+        self.touch(&key);
+
+        if !self.data.contains_key(&key) {
+            return Ok(None);
+        }
+
+        let (removed, before_size, after_size) = {
+            let entry = self.data.get_mut(&key).expect("key existence checked");
+            match entry.obj_mut() {
+                RedisObject::Hash(hash) => {
+                    let before_size = hash.estimated_size();
+                    let removed = fields.iter().map(|field| hash.remove(field) as i64).sum();
+                    let after_size = hash.estimated_size();
+                    (removed, before_size, after_size)
+                }
+                _ => return Err(Frame::Error(WRONGTYPE.into())),
+            }
+        };
+
+        self.apply_size_delta(before_size, after_size);
+        Ok(Some(removed))
+    }
+
+    pub(crate) fn list_push_many(
+        &mut self,
+        key: String,
+        values: Vec<Bytes>,
+        front: bool,
+    ) -> Result<usize, Frame> {
+        self.expire_if_needed(&key);
+        self.touch(&key);
+        if !self.data.contains_key(&key) {
+            self.set(key.clone(), RedisObject::List(List::new()));
+        }
+
+        let (len, before_size, after_size) = {
+            let entry = self.data.get_mut(&key).expect("key exists after insertion");
+            match entry.obj_mut() {
+                RedisObject::List(list) => {
+                    let before_size = list.estimated_size();
+                    for value in values {
+                        if front {
+                            list.push_front(value);
+                        } else {
+                            list.push_back(value);
+                        }
+                    }
+                    let after_size = list.estimated_size();
+                    (list.len(), before_size, after_size)
+                }
+                _ => return Err(Frame::Error(WRONGTYPE.into())),
+            }
+        };
+
+        self.apply_size_delta(before_size, after_size);
+        Ok(len)
+    }
+
+    pub(crate) fn list_pop_many(
+        &mut self,
+        key: String,
+        count: Option<u64>,
+        front: bool,
+    ) -> Result<Option<Vec<Bytes>>, Frame> {
+        self.expire_if_needed(&key);
+        self.touch(&key);
+
+        if !self.data.contains_key(&key) {
+            return Ok(None);
+        }
+
+        let (values, before_size, after_size) = {
+            let entry = self.data.get_mut(&key).expect("key existence checked");
+            match entry.obj_mut() {
+                RedisObject::List(list) => {
+                    let before_size = list.estimated_size();
+                    let mut values = Vec::new();
+
+                    match count {
+                        None => {
+                            let value = if front {
+                                list.pop_front()
+                            } else {
+                                list.pop_back()
+                            };
+                            if let Some(value) = value {
+                                values.push(value);
+                            }
+                        }
+                        Some(n) => {
+                            values.reserve(n as usize);
+                            for _ in 0..n {
+                                let value = if front {
+                                    list.pop_front()
+                                } else {
+                                    list.pop_back()
+                                };
+                                match value {
+                                    Some(value) => values.push(value),
+                                    None => break,
+                                }
+                            }
+                        }
+                    }
+
+                    let after_size = list.estimated_size();
+                    (values, before_size, after_size)
+                }
+                _ => return Err(Frame::Error(WRONGTYPE.into())),
+            }
+        };
+
+        self.apply_size_delta(before_size, after_size);
+        Ok(Some(values))
+    }
+
     /// Estimate memory overhead for a key string.
     fn key_overhead(key: &str) -> usize {
         // String allocation + HashMap entry overhead
         key.len() + 64
+    }
+
+    fn apply_size_delta(&mut self, before: usize, after: usize) {
+        if after >= before {
+            self.used_memory += after - before;
+        } else {
+            self.used_memory = self.used_memory.saturating_sub(before - after);
+        }
     }
 }
 
@@ -484,6 +641,64 @@ mod tests {
         let after_set = db.used_memory();
         db.remove("k");
         assert!(db.used_memory() < after_set);
+    }
+
+    #[test]
+    fn used_memory_tracks_hash_mutations() {
+        let mut db = db();
+        db.set("h".into(), RedisObject::Hash(Hash::new()));
+        let before = db.used_memory();
+
+        let added = db
+            .hash_upsert_many("h".into(), vec![(b("field"), b("value"))])
+            .unwrap();
+        assert_eq!(added, 1);
+        assert!(db.used_memory() > before);
+
+        let after_insert = db.used_memory();
+        let removed = db.hash_remove_many("h".into(), vec![b("field")]).unwrap();
+        assert_eq!(removed, Some(1));
+        assert!(db.used_memory() < after_insert);
+    }
+
+    #[test]
+    fn used_memory_tracks_hash_promotion() {
+        let mut db = db();
+        db.set("h".into(), RedisObject::Hash(Hash::new()));
+        db.hash_upsert_many("h".into(), vec![(b("f"), b("v"))])
+            .unwrap();
+        let before = db.used_memory();
+
+        let big = Bytes::from(vec![b'x'; crate::encoding::HASH_MAX_LISTPACK_VALUE + 1]);
+        db.hash_upsert_many("h".into(), vec![(b("big"), big)])
+            .unwrap();
+
+        assert!(db.used_memory() > before);
+        assert_eq!(
+            db.get_hash("h").unwrap().unwrap().encoding_name(),
+            "hashtable"
+        );
+    }
+
+    #[test]
+    fn used_memory_tracks_list_mutations() {
+        let mut db = db();
+        db.set("l".into(), RedisObject::List(List::new()));
+        let before = db.used_memory();
+
+        let len = db
+            .list_push_many("l".into(), vec![b("a"), b("b")], false)
+            .unwrap();
+        assert_eq!(len, 2);
+        assert!(db.used_memory() > before);
+
+        let after_push = db.used_memory();
+        let popped = db
+            .list_pop_many("l".into(), Some(1), false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(popped, vec![b("b")]);
+        assert!(db.used_memory() < after_push);
     }
 
     // --- random_keys ---

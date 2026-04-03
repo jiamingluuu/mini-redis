@@ -101,7 +101,7 @@ async fn main() -> anyhow::Result<()> {
     // 1. If AOF is enabled and the file exists → replay AOF (most recent data)
     // 2. Else if RDB is enabled and file exists → load RDB (fast binary load)
     // 3. Else → empty Db
-    let db = if aof_config.enabled && aof_config.path.exists() {
+    let mut db = if aof_config.enabled && aof_config.path.exists() {
         eprintln!("Replaying AOF from {:?}…", aof_config.path);
         let db = Aof::replay(&aof_config.path)?;
         eprintln!("AOF replay complete");
@@ -120,6 +120,8 @@ async fn main() -> anyhow::Result<()> {
         }
         db::Db::new(eviction_policy)
     };
+
+    db.set_eviction_policy(eviction_policy);
 
     let aof = if aof_config.enabled {
         Some(Aof::open(&aof_config)?)

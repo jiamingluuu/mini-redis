@@ -92,6 +92,17 @@ impl List {
         self.deque().len()
     }
 
+    /// Rough size estimate used for maxmemory enforcement.
+    ///
+    /// REDIS: quicklists carry more structural overhead than small listpacks.
+    /// We keep the estimate simple but make promotion visible to memory policy.
+    pub(crate) fn estimated_size(&self) -> usize {
+        match &self.0 {
+            Encoding::Listpack(deque) => 16 + deque.iter().map(|v| v.len() + 8).sum::<usize>(),
+            Encoding::Linked(deque) => 32 + deque.iter().map(|v| v.len() + 32).sum::<usize>(),
+        }
+    }
+
     /// Iterate over elements front-to-back regardless of encoding.
     ///
     /// REDIS: Used by RDB serialization to dump all list elements.
@@ -297,5 +308,16 @@ mod tests {
         l.push_back(b("after"));
         assert_eq!(l.len(), 2);
         assert_eq!(l.pop_back(), Some(b("after")));
+    }
+
+    #[test]
+    fn promotion_changes_estimated_size() {
+        let mut l = List::new();
+        l.push_back(b("small"));
+        let before = l.estimated_size();
+
+        l.push_back(Bytes::from(vec![b'x'; LIST_MAX_LISTPACK_VALUE + 1]));
+        assert_eq!(l.encoding_name(), "quicklist");
+        assert!(l.estimated_size() > before);
     }
 }

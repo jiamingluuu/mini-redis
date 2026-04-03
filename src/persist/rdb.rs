@@ -703,4 +703,23 @@ mod tests {
         // Fresh key should be accessible
         assert_eq!(loaded.get_str("fresh").unwrap().unwrap(), &b("new"));
     }
+
+    #[test]
+    fn decoded_db_can_adopt_runtime_eviction_policy() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.rdb");
+
+        let mut db = Db::new(EvictionPolicy::NoEviction);
+        db.set("k".into(), RedisObject::Str(b("v")));
+
+        encode(&db, &path).unwrap();
+        let mut loaded = decode(&path).unwrap();
+        loaded.set_eviction_policy(crate::eviction::EvictionPolicy::AllKeysLru);
+
+        let before = loaded.get_entry("k").unwrap().lru_clock();
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        assert_eq!(loaded.get_str("k"), Ok(Some(&b("v"))));
+        let after = loaded.get_entry("k").unwrap().lru_clock();
+        assert!(after > before, "expected LRU clock to update after access");
+    }
 }
