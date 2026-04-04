@@ -6,6 +6,7 @@
 //! (stored in a separate `expires` dict). We combine all of this into a single
 //! `Entry` struct for simplicity.
 
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::object::RedisObject;
@@ -20,7 +21,7 @@ const LFU_INIT_VAL: u8 = 5;
 /// data for LRU/LFU eviction.
 #[derive(Debug, Clone)]
 pub(crate) struct Entry {
-    obj: RedisObject,
+    obj: Arc<RedisObject>,
     /// Expiry timestamp in epoch milliseconds, or `None` for no expiry.
     /// REDIS: Stored in a separate `expires` dict mapping key → ms timestamp.
     expires_at: Option<u64>,
@@ -42,7 +43,7 @@ impl Entry {
     pub(crate) fn new(obj: RedisObject, lru_clock: u32) -> Self {
         let now_min = now_minutes();
         Self {
-            obj,
+            obj: Arc::new(obj),
             expires_at: None,
             lru_clock,
             lfu_data: ((now_min as u32) << 8) | LFU_INIT_VAL as u32,
@@ -130,16 +131,21 @@ impl Entry {
     }
 
     pub(crate) fn obj(&self) -> &RedisObject {
-        &self.obj
+        self.obj.as_ref()
     }
 
-    pub(crate) fn obj_mut(&mut self) -> &mut RedisObject {
-        &mut self.obj
+    /// Return a mutable object reference using copy-on-write semantics.
+    ///
+    /// REDIS: BGSAVE snapshots rely on COW page tables after `fork()`. We model
+    /// that at the object level: if a snapshot still shares this object, the
+    /// first mutation clones the object and preserves snapshot isolation.
+    pub(crate) fn obj_mut_cow(&mut self) -> &mut RedisObject {
+        Arc::make_mut(&mut self.obj)
     }
 
     #[allow(dead_code)]
     pub(crate) fn into_obj(self) -> RedisObject {
-        self.obj
+        Arc::unwrap_or_clone(self.obj)
     }
 
     /// Rough size estimate for memory tracking.

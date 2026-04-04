@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::time::Duration;
 
 use tokio::sync::{mpsc, oneshot};
 
@@ -23,11 +24,17 @@ pub(crate) enum StoreCmd {
     /// Snapshot the Db to an RDB file in a background task.
     ///
     /// REDIS: BGSAVE in rdb.c — Redis forks and the child writes the snapshot.
-    /// We can't fork, so we clone the Db (cheap: Bytes are Arc'd) and spawn a
-    /// tokio task instead. The reply is sent immediately with +OK.
+    /// We model this with app-level COW: capture a Db snapshot made of Arc
+    /// handles at command dispatch time, then encode it in a background task.
+    /// The reply is sent immediately with +OK.
     BgSave {
         path: PathBuf,
         reply: oneshot::Sender<Frame>,
+    },
+    /// Internal completion event from the background snapshot worker.
+    BgSaveDone {
+        result: Result<(), String>,
+        duration: Duration,
     },
 }
 
@@ -43,14 +50,19 @@ pub(crate) enum StoreCmd {
 pub(crate) struct Store {
     db: Db,
     rx: mpsc::Receiver<StoreCmd>,
+    tx: mpsc::Sender<StoreCmd>,
     aof: Option<Aof>,
     aof_error: Option<String>,
     eviction_config: EvictionConfig,
+    bgsave_running: bool,
+    last_bgsave_error: Option<String>,
+    last_bgsave_duration: Option<Duration>,
 }
 
 impl Store {
     pub(crate) fn new(
         db: Db,
+        tx: mpsc::Sender<StoreCmd>,
         rx: mpsc::Receiver<StoreCmd>,
         aof: Option<Aof>,
         eviction_config: EvictionConfig,
@@ -58,9 +70,13 @@ impl Store {
         Self {
             db,
             rx,
+            tx,
             aof,
             aof_error: None,
             eviction_config,
+            bgsave_running: false,
+            last_bgsave_error: None,
+            last_bgsave_duration: None,
         }
     }
 
@@ -146,16 +162,55 @@ impl Store {
                 let _ = reply.send(frame);
             }
             StoreCmd::BgSave { path, reply } => {
-                // REDIS: BGSAVE clones the Db snapshot, replies immediately,
-                // and writes the RDB file in the background. In production Redis
-                // this is a fork(); we use Db::clone() + tokio::spawn instead.
-                let snapshot = self.db.clone();
+                // REDIS: Return BUSY if a background save is already in progress.
+                if self.bgsave_running {
+                    let _ = reply.send(Frame::Error(
+                        "ERR Background save already in progress".into(),
+                    ));
+                    return;
+                }
+
+                // REDIS: Snapshot boundary is when BGSAVE is handled by the main
+                // loop. We capture both snapshot data and snapshot time here.
+                let snapshot_ms = crate::entry::now_ms();
+                let snapshot = self.db.snapshot();
+                let tx = self.tx.clone();
+
+                self.bgsave_running = true;
                 let _ = reply.send(Frame::Simple("Background saving started".into()));
+
                 tokio::spawn(async move {
-                    if let Err(e) = crate::persist::rdb::encode(&snapshot, &path) {
-                        eprintln!("BGSAVE error: {e}");
-                    }
+                    let started = std::time::Instant::now();
+                    let result = match tokio::task::spawn_blocking(move || {
+                        crate::persist::rdb::encode_snapshot(&snapshot, &path, snapshot_ms)
+                    })
+                    .await
+                    {
+                        Ok(Ok(())) => Ok(()),
+                        Ok(Err(e)) => Err(e.to_string()),
+                        Err(e) => Err(format!("BGSAVE task failed: {e}")),
+                    };
+
+                    let _ = tx
+                        .send(StoreCmd::BgSaveDone {
+                            result,
+                            duration: started.elapsed(),
+                        })
+                        .await;
                 });
+            }
+            StoreCmd::BgSaveDone { result, duration } => {
+                self.bgsave_running = false;
+                self.last_bgsave_duration = Some(duration);
+                match result {
+                    Ok(()) => {
+                        self.last_bgsave_error = None;
+                    }
+                    Err(err) => {
+                        eprintln!("BGSAVE error: {err}");
+                        self.last_bgsave_error = Some(err);
+                    }
+                }
             }
         }
     }
@@ -227,7 +282,10 @@ pub(crate) struct StoreHandle {
 impl StoreHandle {
     pub(crate) fn new(db: Db, aof: Option<Aof>, eviction_config: EvictionConfig) -> (Self, Store) {
         let (tx, rx) = mpsc::channel(256);
-        (Self { tx }, Store::new(db, rx, aof, eviction_config))
+        (
+            Self { tx: tx.clone() },
+            Store::new(db, tx, rx, aof, eviction_config),
+        )
     }
 
     pub(crate) async fn execute(&self, cmd: Command) -> anyhow::Result<Frame> {
@@ -280,6 +338,8 @@ impl StoreHandle {
 mod tests {
     use bytes::Bytes;
     use std::io;
+    use std::path::Path;
+    use std::time::Duration;
 
     use super::*;
     use crate::cmd::{
@@ -338,6 +398,16 @@ mod tests {
 
     async fn exec(h: &StoreHandle, cmd: Command) -> Frame {
         h.execute(cmd).await.unwrap()
+    }
+
+    async fn wait_for_rdb(path: &Path) {
+        for _ in 0..200 {
+            if path.exists() && crate::persist::rdb::decode(path).is_ok() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("timed out waiting for RDB at {}", path.display());
     }
 
     // --- String ---
@@ -1164,6 +1234,196 @@ mod tests {
                 Bytes::from_static(b"c"),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn bgsave_snapshot_excludes_late_writes() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let rdb_path = dir.path().join("dump.rdb");
+
+        let (h, store) = StoreHandle::new(
+            Db::new(crate::eviction::EvictionPolicy::NoEviction),
+            None,
+            EvictionConfig::default(),
+        );
+        tokio::spawn(store.run());
+
+        exec(
+            &h,
+            Command::Write(WriteCmd::String(StringWrite::Set(
+                "a".into(),
+                Bytes::from_static(b"1"),
+                None,
+            ))),
+        )
+        .await;
+
+        let result = h.bgsave(rdb_path.clone()).await.unwrap();
+        assert_eq!(result, Frame::Simple("Background saving started".into()));
+
+        // Happens after snapshot boundary; must not appear in the RDB.
+        exec(
+            &h,
+            Command::Write(WriteCmd::String(StringWrite::Set(
+                "b".into(),
+                Bytes::from_static(b"2"),
+                None,
+            ))),
+        )
+        .await;
+
+        wait_for_rdb(&rdb_path).await;
+
+        let mut db = crate::persist::rdb::decode(&rdb_path).unwrap();
+        assert_eq!(db.get_str("a").unwrap().unwrap(), &Bytes::from_static(b"1"));
+        assert_eq!(db.get_str("b"), Ok(None));
+    }
+
+    #[tokio::test]
+    async fn bgsave_returns_busy_while_running() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let rdb_path = dir.path().join("dump.rdb");
+
+        let (h, store) = StoreHandle::new(
+            Db::new(crate::eviction::EvictionPolicy::NoEviction),
+            None,
+            EvictionConfig::default(),
+        );
+        tokio::spawn(store.run());
+
+        // Large value makes the background encode take long enough that a
+        // second BGSAVE call deterministically overlaps.
+        exec(
+            &h,
+            Command::Write(WriteCmd::String(StringWrite::Set(
+                "big".into(),
+                Bytes::from(vec![b'x'; 20_000_000]),
+                None,
+            ))),
+        )
+        .await;
+
+        let first = h.bgsave(rdb_path.clone()).await.unwrap();
+        assert_eq!(first, Frame::Simple("Background saving started".into()));
+
+        let second = h.bgsave(rdb_path.clone()).await.unwrap();
+        assert_eq!(
+            second,
+            Frame::Error("ERR Background save already in progress".into())
+        );
+
+        wait_for_rdb(&rdb_path).await;
+    }
+
+    #[tokio::test]
+    async fn bgsave_snapshot_isolated_from_hash_and_list_mutations() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let rdb_path = dir.path().join("dump.rdb");
+
+        let (h, store) = StoreHandle::new(
+            Db::new(crate::eviction::EvictionPolicy::NoEviction),
+            None,
+            EvictionConfig::default(),
+        );
+        tokio::spawn(store.run());
+
+        exec(
+            &h,
+            Command::Write(WriteCmd::Hash(HashWrite::HSet(
+                "hash".into(),
+                vec![(Bytes::from_static(b"f1"), Bytes::from_static(b"v1"))],
+            ))),
+        )
+        .await;
+        exec(
+            &h,
+            Command::Write(WriteCmd::List(ListWrite::RPush(
+                "list".into(),
+                vec![Bytes::from_static(b"a")],
+            ))),
+        )
+        .await;
+
+        let result = h.bgsave(rdb_path.clone()).await.unwrap();
+        assert_eq!(result, Frame::Simple("Background saving started".into()));
+
+        // Mutations after snapshot start should not appear in the dump.
+        exec(
+            &h,
+            Command::Write(WriteCmd::Hash(HashWrite::HSet(
+                "hash".into(),
+                vec![(Bytes::from_static(b"f2"), Bytes::from_static(b"v2"))],
+            ))),
+        )
+        .await;
+        exec(
+            &h,
+            Command::Write(WriteCmd::List(ListWrite::RPush(
+                "list".into(),
+                vec![Bytes::from_static(b"b")],
+            ))),
+        )
+        .await;
+
+        wait_for_rdb(&rdb_path).await;
+
+        let mut snapshot_db = crate::persist::rdb::decode(&rdb_path).unwrap();
+        let hash = snapshot_db.get_hash("hash").unwrap().unwrap();
+        assert_eq!(hash.len(), 1);
+        assert_eq!(
+            hash.get(&Bytes::from_static(b"f1")),
+            Some(&Bytes::from_static(b"v1"))
+        );
+        assert_eq!(hash.get(&Bytes::from_static(b"f2")), None);
+
+        let list = snapshot_db.get_list("list").unwrap().unwrap();
+        assert_eq!(list.range(0, -1), vec![Bytes::from_static(b"a")]);
+    }
+
+    #[tokio::test]
+    async fn bgsave_failure_resets_running_state() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let bad_path = dir.path().join("missing").join("dump.rdb");
+        let good_path = dir.path().join("dump.rdb");
+
+        let (h, store) = StoreHandle::new(
+            Db::new(crate::eviction::EvictionPolicy::NoEviction),
+            None,
+            EvictionConfig::default(),
+        );
+        tokio::spawn(store.run());
+
+        exec(
+            &h,
+            Command::Write(WriteCmd::String(StringWrite::Set(
+                "k".into(),
+                Bytes::from_static(b"v"),
+                None,
+            ))),
+        )
+        .await;
+
+        let first = h.bgsave(bad_path).await.unwrap();
+        assert_eq!(first, Frame::Simple("Background saving started".into()));
+
+        // Wait for the failed save to clear running state, then ensure a new
+        // BGSAVE can start and complete.
+        let mut started = false;
+        for _ in 0..50 {
+            let result = h.bgsave(good_path.clone()).await.unwrap();
+            match result {
+                Frame::Simple(ref msg) if msg == "Background saving started" => {
+                    started = true;
+                    break;
+                }
+                Frame::Error(ref msg) if msg == "ERR Background save already in progress" => {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                other => panic!("unexpected BGSAVE response: {other:?}"),
+            }
+        }
+        assert!(started, "expected BGSAVE to recover after failed run");
+        wait_for_rdb(&good_path).await;
     }
 
     #[tokio::test]

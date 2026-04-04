@@ -17,7 +17,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use bytes::Bytes;
 
 use super::crc64::crc64;
-use crate::db::Db;
+use crate::db::{Db, DbSnapshot};
+use crate::entry;
 use crate::eviction::EvictionPolicy;
 use crate::object::RedisObject;
 use crate::types::hash::Hash;
@@ -63,6 +64,21 @@ pub(crate) struct RdbConfig {
 /// writes the header, AUX fields, DB selector, resize hint, all key-value
 /// pairs, EOF marker, and CRC64 checksum.
 pub(crate) fn encode(db: &Db, path: &Path) -> io::Result<()> {
+    let snapshot_ms = entry::now_ms();
+    let snapshot = db.snapshot();
+    encode_snapshot(&snapshot, path, snapshot_ms)
+}
+
+/// Encode a point-in-time snapshot to an RDB file.
+///
+/// `snapshot_ms` is the linearization timestamp captured by the caller at
+/// snapshot start (Store actor when handling BGSAVE). Keys whose TTL is at or
+/// before `snapshot_ms` are omitted from the dump.
+pub(crate) fn encode_snapshot(
+    snapshot: &DbSnapshot,
+    path: &Path,
+    snapshot_ms: u64,
+) -> io::Result<()> {
     let mut buf: Vec<u8> = Vec::new();
 
     // -- Header --
@@ -81,14 +97,30 @@ pub(crate) fn encode(db: &Db, path: &Path) -> io::Result<()> {
     buf.push(RDB_OPCODE_SELECTDB);
     write_length(&mut buf, 0);
 
+    let mut live_keys = 0u64;
+    let mut live_expiry_keys = 0u64;
+    for (_, entry) in snapshot.iter() {
+        if !include_in_snapshot(entry, snapshot_ms) {
+            continue;
+        }
+        live_keys += 1;
+        if entry.expires_at().is_some() {
+            live_expiry_keys += 1;
+        }
+    }
+
     buf.push(RDB_OPCODE_RESIZEDB);
-    write_length(&mut buf, db.len() as u64);
-    write_length(&mut buf, db.expiry_count() as u64);
+    write_length(&mut buf, live_keys);
+    write_length(&mut buf, live_expiry_keys);
 
     // -- Key-value pairs --
     // REDIS: rdbSaveKeyValuePair() in rdb.c emits the expiry opcode before
     // the type+key+value triple when the key has a TTL.
-    for (key, entry) in db.iter() {
+    for (key, entry) in snapshot.iter() {
+        if !include_in_snapshot(entry, snapshot_ms) {
+            continue;
+        }
+
         if let Some(expires_at) = entry.expires_at() {
             buf.push(RDB_OPCODE_EXPIRETIME_MS);
             buf.extend_from_slice(&expires_at.to_le_bytes());
@@ -110,6 +142,13 @@ pub(crate) fn encode(db: &Db, path: &Path) -> io::Result<()> {
     std::fs::rename(&tmp_path, path)?;
 
     Ok(())
+}
+
+fn include_in_snapshot(entry: &crate::entry::Entry, snapshot_ms: u64) -> bool {
+    match entry.expires_at() {
+        Some(expires_at) => expires_at > snapshot_ms,
+        None => true,
+    }
 }
 
 fn write_aux(buf: &mut Vec<u8>, key: &[u8], value: &[u8]) {
@@ -481,7 +520,7 @@ mod tests {
         let path = dir.path().join("test.rdb");
         let db = Db::new(EvictionPolicy::NoEviction);
         encode(&db, &path).unwrap();
-        let mut loaded = decode(&path).unwrap();
+        let loaded = decode(&path).unwrap();
         assert_eq!(loaded.len(), 0);
     }
 
@@ -702,6 +741,41 @@ mod tests {
         assert_eq!(loaded.get_str("stale"), Ok(None));
         // Fresh key should be accessible
         assert_eq!(loaded.get_str("fresh").unwrap().unwrap(), &b("new"));
+    }
+
+    #[test]
+    fn encode_snapshot_excludes_key_expired_at_boundary() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.rdb");
+
+        let mut db = Db::new(EvictionPolicy::NoEviction);
+        db.set_with_expiry("expired".into(), RedisObject::Str(b("v")), Some(1000));
+        db.set_with_expiry("live".into(), RedisObject::Str(b("v")), Some(1001));
+
+        let snapshot = db.snapshot();
+        encode_snapshot(&snapshot, &path, 1000).unwrap();
+        let loaded = decode(&path).unwrap();
+
+        assert_eq!(loaded.get_expiry("expired"), None);
+        assert_eq!(loaded.get_expiry("live"), Some(Some(1001)));
+    }
+
+    #[test]
+    fn encode_snapshot_includes_future_expiry_even_if_wall_clock_moves() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.rdb");
+
+        let mut db = Db::new(EvictionPolicy::NoEviction);
+        let snapshot_ms = crate::entry::now_ms();
+        let expires_at = snapshot_ms + 50;
+        db.set_with_expiry("k".into(), RedisObject::Str(b("v")), Some(expires_at));
+
+        let snapshot = db.snapshot();
+        std::thread::sleep(std::time::Duration::from_millis(60));
+
+        encode_snapshot(&snapshot, &path, snapshot_ms).unwrap();
+        let loaded = decode(&path).unwrap();
+        assert_eq!(loaded.get_expiry("k"), Some(Some(expires_at)));
     }
 
     #[test]

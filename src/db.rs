@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use bytes::Bytes;
 use rand::seq::IteratorRandom;
@@ -27,9 +28,24 @@ pub(crate) const WRONGTYPE: &str =
 /// — lazy expiry and access tracking are handled transparently.
 #[derive(Debug, Clone)]
 pub(crate) struct Db {
-    data: HashMap<String, Entry>,
+    data: HashMap<String, Arc<Entry>>,
     eviction_policy: EvictionPolicy,
     used_memory: usize,
+}
+
+/// Immutable point-in-time view of the keyspace used for snapshot persistence.
+///
+/// REDIS: Production Redis gets this via `fork()` + OS page-level COW. We model
+/// it by cloning Arc handles to entries; writes on the live DB use `Arc::make_mut`.
+#[derive(Debug, Clone)]
+pub(crate) struct DbSnapshot {
+    data: HashMap<String, Arc<Entry>>,
+}
+
+impl DbSnapshot {
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (&String, &Entry)> {
+        self.data.iter().map(|(key, entry)| (key, entry.as_ref()))
+    }
 }
 
 impl Db {
@@ -52,8 +68,19 @@ impl Db {
     /// Iterate over all key-entry pairs.
     ///
     /// REDIS: Used by RDB serialization to snapshot the entire keyspace.
+    #[allow(dead_code)]
     pub(crate) fn iter(&self) -> impl Iterator<Item = (&String, &Entry)> {
-        self.data.iter()
+        self.data.iter().map(|(key, entry)| (key, entry.as_ref()))
+    }
+
+    /// Capture an immutable point-in-time snapshot of the keyspace.
+    ///
+    /// REDIS: Equivalent to the `fork()` boundary for BGSAVE — entries are
+    /// shared until the live DB mutates them via `Arc::make_mut`.
+    pub(crate) fn snapshot(&self) -> DbSnapshot {
+        DbSnapshot {
+            data: self.data.clone(),
+        }
     }
 
     /// Number of keys in the database.
@@ -70,19 +97,19 @@ impl Db {
     pub(crate) fn expiry_count(&self) -> usize {
         self.data
             .values()
-            .filter(|e| e.expires_at().is_some())
+            .filter(|entry| entry.expires_at().is_some())
             .count()
     }
 
     /// Read-only access to an Entry (for eviction metadata inspection).
     pub(crate) fn get_entry(&self, key: &str) -> Option<&Entry> {
-        self.data.get(key)
+        self.data.get(key).map(Arc::as_ref)
     }
 
     /// Mutable access to an Entry (for eviction/expiry tests and LRU/LFU manipulation).
     #[cfg(test)]
     pub(crate) fn get_entry_mut(&mut self, key: &str) -> Option<&mut Entry> {
-        self.data.get_mut(key)
+        self.data.get_mut(key).map(Arc::make_mut)
     }
 
     /// Sample `count` random keys from the database.
@@ -104,7 +131,7 @@ impl Db {
         let mut rng = rand::thread_rng();
         self.data
             .iter()
-            .filter(|(_, e)| e.expires_at().is_some())
+            .filter(|(_, entry)| entry.expires_at().is_some())
             .map(|(k, _)| k)
             .choose_multiple(&mut rng, count)
             .into_iter()
@@ -125,17 +152,23 @@ impl Db {
         let expired = self
             .data
             .get(key)
-            .is_some_and(|e| e.is_expired(entry::now_ms()));
+            .is_some_and(|entry| entry.is_expired(entry::now_ms()));
         if expired {
             self.remove(key);
         }
         expired
     }
 
+    /// Return a mutable entry using copy-on-write semantics.
+    fn entry_make_mut(&mut self, key: &str) -> Option<&mut Entry> {
+        self.data.get_mut(key).map(Arc::make_mut)
+    }
+
     /// Touch access-tracking metadata for a key.
     fn touch(&mut self, key: &str) {
-        if let Some(entry) = self.data.get_mut(key) {
-            match self.eviction_policy {
+        let policy = self.eviction_policy;
+        if let Some(entry) = self.entry_make_mut(key) {
+            match policy {
                 EvictionPolicy::AllKeysLru => {
                     // Use seconds since epoch modulo u32::MAX as a simple clock
                     let clock = (entry::now_ms() / 1000) as u32;
@@ -160,7 +193,7 @@ impl Db {
         if let Some(entry) = self.data.remove(key) {
             self.used_memory = self
                 .used_memory
-                .saturating_sub(Self::key_overhead(key) + entry.estimated_size());
+                .saturating_sub(Self::key_overhead(key) + entry.as_ref().estimated_size());
             true
         } else {
             false
@@ -186,7 +219,7 @@ impl Db {
         if let Some(old) = self.data.get(&key) {
             self.used_memory = self
                 .used_memory
-                .saturating_sub(Self::key_overhead(&key) + old.estimated_size());
+                .saturating_sub(Self::key_overhead(&key) + old.as_ref().estimated_size());
         }
 
         let clock = (entry::now_ms() / 1000) as u32;
@@ -194,17 +227,17 @@ impl Db {
         new_entry.set_expires_at(expires_at);
 
         self.used_memory += Self::key_overhead(&key) + new_entry.estimated_size();
-        self.data.insert(key, new_entry);
+        self.data.insert(key, Arc::new(new_entry));
     }
 
     /// Get the expiry timestamp for a key (if any).
     pub(crate) fn get_expiry(&self, key: &str) -> Option<Option<u64>> {
-        self.data.get(key).map(|e| e.expires_at())
+        self.data.get(key).map(|entry| entry.expires_at())
     }
 
     /// Set or remove expiry on an existing key. Returns `true` if the key exists.
     pub(crate) fn set_expiry(&mut self, key: &str, expires_at: Option<u64>) -> bool {
-        if let Some(entry) = self.data.get_mut(key) {
+        if let Some(entry) = self.entry_make_mut(key) {
             entry.set_expires_at(expires_at);
             true
         } else {
@@ -220,7 +253,7 @@ impl Db {
     pub(crate) fn get_str(&mut self, key: &str) -> Result<Option<&Bytes>, Frame> {
         self.expire_if_needed(key);
         self.touch(key);
-        match self.data.get(key).map(|e| e.obj()) {
+        match self.data.get(key).map(|entry| entry.obj()) {
             Some(RedisObject::Str(b)) => Ok(Some(b)),
             Some(_) => Err(Frame::Error(WRONGTYPE.into())),
             None => Ok(None),
@@ -231,7 +264,7 @@ impl Db {
     pub(crate) fn get_hash(&mut self, key: &str) -> Result<Option<&Hash>, Frame> {
         self.expire_if_needed(key);
         self.touch(key);
-        match self.data.get(key).map(|e| e.obj()) {
+        match self.data.get(key).map(|entry| entry.obj()) {
             Some(RedisObject::Hash(h)) => Ok(Some(h)),
             Some(_) => Err(Frame::Error(WRONGTYPE.into())),
             None => Ok(None),
@@ -243,7 +276,7 @@ impl Db {
     pub(crate) fn get_hash_mut(&mut self, key: &str) -> Result<Option<&mut Hash>, Frame> {
         self.expire_if_needed(key);
         self.touch(key);
-        match self.data.get_mut(key).map(|e| e.obj_mut()) {
+        match self.entry_make_mut(key).map(|entry| entry.obj_mut_cow()) {
             Some(RedisObject::Hash(h)) => Ok(Some(h)),
             Some(_) => Err(Frame::Error(WRONGTYPE.into())),
             None => Ok(None),
@@ -254,7 +287,7 @@ impl Db {
     pub(crate) fn get_list(&mut self, key: &str) -> Result<Option<&List>, Frame> {
         self.expire_if_needed(key);
         self.touch(key);
-        match self.data.get(key).map(|e| e.obj()) {
+        match self.data.get(key).map(|entry| entry.obj()) {
             Some(RedisObject::List(l)) => Ok(Some(l)),
             Some(_) => Err(Frame::Error(WRONGTYPE.into())),
             None => Ok(None),
@@ -271,8 +304,8 @@ impl Db {
         if !self.data.contains_key(&key) {
             self.set(key.clone(), RedisObject::Hash(Hash::new()));
         }
-        let entry = self.data.get_mut(&key).expect("just inserted");
-        match entry.obj_mut() {
+        let entry = self.entry_make_mut(&key).expect("just inserted");
+        match entry.obj_mut_cow() {
             RedisObject::Hash(h) => Ok(h),
             _ => Err(Frame::Error(WRONGTYPE.into())),
         }
@@ -288,8 +321,8 @@ impl Db {
         if !self.data.contains_key(&key) {
             self.set(key.clone(), RedisObject::List(List::new()));
         }
-        let entry = self.data.get_mut(&key).expect("just inserted");
-        match entry.obj_mut() {
+        let entry = self.entry_make_mut(&key).expect("just inserted");
+        match entry.obj_mut_cow() {
             RedisObject::List(l) => Ok(l),
             _ => Err(Frame::Error(WRONGTYPE.into())),
         }
@@ -307,8 +340,10 @@ impl Db {
         }
 
         let (added, before_size, after_size) = {
-            let entry = self.data.get_mut(&key).expect("key exists after insertion");
-            match entry.obj_mut() {
+            let entry = self
+                .entry_make_mut(&key)
+                .expect("key exists after insertion");
+            match entry.obj_mut_cow() {
                 RedisObject::Hash(hash) => {
                     let before_size = hash.estimated_size();
                     let added = pairs
@@ -339,8 +374,8 @@ impl Db {
         }
 
         let (removed, before_size, after_size) = {
-            let entry = self.data.get_mut(&key).expect("key existence checked");
-            match entry.obj_mut() {
+            let entry = self.entry_make_mut(&key).expect("key existence checked");
+            match entry.obj_mut_cow() {
                 RedisObject::Hash(hash) => {
                     let before_size = hash.estimated_size();
                     let removed = fields.iter().map(|field| hash.remove(field) as i64).sum();
@@ -368,8 +403,10 @@ impl Db {
         }
 
         let (len, before_size, after_size) = {
-            let entry = self.data.get_mut(&key).expect("key exists after insertion");
-            match entry.obj_mut() {
+            let entry = self
+                .entry_make_mut(&key)
+                .expect("key exists after insertion");
+            match entry.obj_mut_cow() {
                 RedisObject::List(list) => {
                     let before_size = list.estimated_size();
                     for value in values {
@@ -404,8 +441,8 @@ impl Db {
         }
 
         let (values, before_size, after_size) = {
-            let entry = self.data.get_mut(&key).expect("key existence checked");
-            match entry.obj_mut() {
+            let entry = self.entry_make_mut(&key).expect("key existence checked");
+            match entry.obj_mut_cow() {
                 RedisObject::List(list) => {
                     let before_size = list.estimated_size();
                     let mut values = Vec::new();
