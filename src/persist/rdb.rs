@@ -80,25 +80,36 @@ pub(crate) fn encode_snapshot(
     snapshot_ms: u64,
 ) -> io::Result<()> {
     let mut buf: Vec<u8> = Vec::new();
+    write_header_and_aux(&mut buf);
+    write_db_selector(&mut buf);
 
-    // -- Header --
+    let (live_keys, live_expiry_keys) = compute_live_snapshot_counts(snapshot, snapshot_ms);
+    write_resizedb_hint(&mut buf, live_keys, live_expiry_keys);
+    write_snapshot_body(&mut buf, snapshot, snapshot_ms);
+    finalize_checksum_and_atomic_persist(&mut buf, path)
+}
+
+fn write_header_and_aux(buf: &mut Vec<u8>) {
     buf.extend_from_slice(RDB_MAGIC);
     buf.extend_from_slice(RDB_VERSION);
 
-    // -- AUX fields --
-    write_aux(&mut buf, b"redis-ver", b"7.0.0");
+    write_aux(buf, b"redis-ver", b"7.0.0");
     let ctime = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    write_aux(&mut buf, b"ctime", ctime.to_string().as_bytes());
+    write_aux(buf, b"ctime", ctime.to_string().as_bytes());
+}
 
-    // -- DB 0 --
+fn write_db_selector(buf: &mut Vec<u8>) {
     buf.push(RDB_OPCODE_SELECTDB);
-    write_length(&mut buf, 0);
+    write_length(buf, 0);
+}
 
+fn compute_live_snapshot_counts(snapshot: &DbSnapshot, snapshot_ms: u64) -> (u64, u64) {
     let mut live_keys = 0u64;
     let mut live_expiry_keys = 0u64;
+
     for (_, entry) in snapshot.iter() {
         if !include_in_snapshot(entry, snapshot_ms) {
             continue;
@@ -109,11 +120,16 @@ pub(crate) fn encode_snapshot(
         }
     }
 
-    buf.push(RDB_OPCODE_RESIZEDB);
-    write_length(&mut buf, live_keys);
-    write_length(&mut buf, live_expiry_keys);
+    (live_keys, live_expiry_keys)
+}
 
-    // -- Key-value pairs --
+fn write_resizedb_hint(buf: &mut Vec<u8>, live_keys: u64, live_expiry_keys: u64) {
+    buf.push(RDB_OPCODE_RESIZEDB);
+    write_length(buf, live_keys);
+    write_length(buf, live_expiry_keys);
+}
+
+fn write_snapshot_body(buf: &mut Vec<u8>, snapshot: &DbSnapshot, snapshot_ms: u64) {
     // REDIS: rdbSaveKeyValuePair() in rdb.c emits the expiry opcode before
     // the type+key+value triple when the key has a TTL.
     for (key, entry) in snapshot.iter() {
@@ -125,19 +141,21 @@ pub(crate) fn encode_snapshot(
             buf.push(RDB_OPCODE_EXPIRETIME_MS);
             buf.extend_from_slice(&expires_at.to_le_bytes());
         }
-        write_key_value(&mut buf, key, entry.obj());
+        write_key_value(buf, key, entry.obj());
     }
+}
 
+fn finalize_checksum_and_atomic_persist(buf: &mut Vec<u8>, path: &Path) -> io::Result<()> {
     // -- EOF + checksum --
     buf.push(RDB_OPCODE_EOF);
-    let checksum = crc64(0, &buf);
+    let checksum = crc64(0, buf);
     buf.extend_from_slice(&checksum.to_le_bytes());
 
     // Atomic write: write to temp file then rename.
     // REDIS: rdbSave() writes to a temp file and renames for crash safety.
     let tmp_path = path.with_extension("rdb.tmp");
     let mut file = std::fs::File::create(&tmp_path)?;
-    file.write_all(&buf)?;
+    file.write_all(buf)?;
     file.sync_all()?;
     std::fs::rename(&tmp_path, path)?;
 
@@ -758,6 +776,19 @@ mod tests {
 
         assert_eq!(loaded.get_expiry("expired"), None);
         assert_eq!(loaded.get_expiry("live"), Some(Some(1001)));
+    }
+
+    #[test]
+    fn compute_live_snapshot_counts_filters_on_snapshot_time() {
+        let mut db = Db::new(EvictionPolicy::NoEviction);
+        db.set_with_expiry("expired".into(), RedisObject::Str(b("v")), Some(1000));
+        db.set_with_expiry("live".into(), RedisObject::Str(b("v")), Some(2000));
+        db.set("no_ttl".into(), RedisObject::Str(b("v")));
+
+        let snapshot = db.snapshot();
+        let (live, with_expiry) = compute_live_snapshot_counts(&snapshot, 1000);
+        assert_eq!(live, 2);
+        assert_eq!(with_expiry, 1);
     }
 
     #[test]

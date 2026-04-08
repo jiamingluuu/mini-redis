@@ -140,8 +140,56 @@ impl Db {
     }
 
     // -----------------------------------------------------------------------
-    // Lazy expiry helper
+    // Access workflow helpers
     // -----------------------------------------------------------------------
+
+    /// Shared pre-read pipeline for commands that inspect a key.
+    fn prepare_read_access(&mut self, key: &str) {
+        self.expire_if_needed(key);
+        self.touch(key);
+    }
+
+    /// Shared pre-write pipeline for commands that may mutate a key.
+    ///
+    /// REDIS: Even mutating commands first run lazy-expiry/access bookkeeping.
+    fn prepare_write_access(&mut self, key: &str) {
+        self.expire_if_needed(key);
+        self.touch(key);
+    }
+
+    fn entry_obj_ref(&self, key: &str) -> Option<&RedisObject> {
+        self.data.get(key).map(|entry| entry.obj())
+    }
+
+    fn entry_obj_mut_cow(&mut self, key: &str) -> Option<&mut RedisObject> {
+        self.entry_make_mut(key).map(|entry| entry.obj_mut_cow())
+    }
+
+    /// Convert "found object with expected type?" into Redis's standard
+    /// `Ok(None)` / `Err(WRONGTYPE)` shape.
+    fn entry_or_wrongtype<'a, T>(
+        maybe_obj: Option<&'a RedisObject>,
+        project: impl FnOnce(&'a RedisObject) -> Option<T>,
+    ) -> Result<Option<T>, Frame> {
+        match maybe_obj {
+            Some(obj) => project(obj)
+                .map(Some)
+                .ok_or_else(|| Frame::Error(WRONGTYPE.into())),
+            None => Ok(None),
+        }
+    }
+
+    fn entry_or_wrongtype_mut<'a, T>(
+        maybe_obj: Option<&'a mut RedisObject>,
+        project: impl FnOnce(&'a mut RedisObject) -> Option<T>,
+    ) -> Result<Option<T>, Frame> {
+        match maybe_obj {
+            Some(obj) => project(obj)
+                .map(Some)
+                .ok_or_else(|| Frame::Error(WRONGTYPE.into())),
+            None => Ok(None),
+        }
+    }
 
     /// Check if a key is expired and remove it if so. Returns `true` if the
     /// key was expired (and removed).
@@ -162,6 +210,59 @@ impl Db {
     /// Return a mutable entry using copy-on-write semantics.
     fn entry_make_mut(&mut self, key: &str) -> Option<&mut Entry> {
         self.data.get_mut(key).map(Arc::make_mut)
+    }
+
+    fn ensure_hash_key(&mut self, key: &str) {
+        if !self.data.contains_key(key) {
+            self.set(key.to_string(), RedisObject::Hash(Hash::new()));
+        }
+    }
+
+    fn ensure_list_key(&mut self, key: &str) {
+        if !self.data.contains_key(key) {
+            self.set(key.to_string(), RedisObject::List(List::new()));
+        }
+    }
+
+    fn with_hash_mut<T>(
+        &mut self,
+        key: &str,
+        f: impl FnOnce(&mut Hash) -> T,
+    ) -> Result<Option<T>, Frame> {
+        Self::entry_or_wrongtype_mut(self.entry_obj_mut_cow(key), |obj| match obj {
+            RedisObject::Hash(hash) => Some(f(hash)),
+            _ => None,
+        })
+    }
+
+    fn with_list_mut<T>(
+        &mut self,
+        key: &str,
+        f: impl FnOnce(&mut List) -> T,
+    ) -> Result<Option<T>, Frame> {
+        Self::entry_or_wrongtype_mut(self.entry_obj_mut_cow(key), |obj| match obj {
+            RedisObject::List(list) => Some(f(list)),
+            _ => None,
+        })
+    }
+
+    fn replace_entry_and_update_memory(&mut self, key: String, new_entry: Entry) {
+        if let Some(old) = self.data.get(&key) {
+            self.used_memory = self
+                .used_memory
+                .saturating_sub(Self::key_overhead(&key) + old.as_ref().estimated_size());
+        }
+
+        self.used_memory += Self::key_overhead(&key) + new_entry.estimated_size();
+        self.data.insert(key, Arc::new(new_entry));
+    }
+
+    fn apply_collection_size_delta(&mut self, before: usize, after: usize) {
+        if after >= before {
+            self.used_memory += after - before;
+        } else {
+            self.used_memory = self.used_memory.saturating_sub(before - after);
+        }
     }
 
     /// Touch access-tracking metadata for a key.
@@ -215,19 +316,10 @@ impl Db {
         obj: RedisObject,
         expires_at: Option<u64>,
     ) {
-        // Remove old entry's memory contribution
-        if let Some(old) = self.data.get(&key) {
-            self.used_memory = self
-                .used_memory
-                .saturating_sub(Self::key_overhead(&key) + old.as_ref().estimated_size());
-        }
-
         let clock = (entry::now_ms() / 1000) as u32;
         let mut new_entry = Entry::new(obj, clock);
         new_entry.set_expires_at(expires_at);
-
-        self.used_memory += Self::key_overhead(&key) + new_entry.estimated_size();
-        self.data.insert(key, Arc::new(new_entry));
+        self.replace_entry_and_update_memory(key, new_entry);
     }
 
     /// Get the expiry timestamp for a key (if any).
@@ -251,47 +343,39 @@ impl Db {
     /// - `Ok(None)`         — key does not exist
     /// - `Err(Frame)`       — key exists with the wrong type (WRONGTYPE error frame)
     pub(crate) fn get_str(&mut self, key: &str) -> Result<Option<&Bytes>, Frame> {
-        self.expire_if_needed(key);
-        self.touch(key);
-        match self.data.get(key).map(|entry| entry.obj()) {
-            Some(RedisObject::Str(b)) => Ok(Some(b)),
-            Some(_) => Err(Frame::Error(WRONGTYPE.into())),
-            None => Ok(None),
-        }
+        self.prepare_read_access(key);
+        Self::entry_or_wrongtype(self.entry_obj_ref(key), |obj| match obj {
+            RedisObject::Str(value) => Some(value),
+            _ => None,
+        })
     }
 
     /// Return a shared reference to a hash.
     pub(crate) fn get_hash(&mut self, key: &str) -> Result<Option<&Hash>, Frame> {
-        self.expire_if_needed(key);
-        self.touch(key);
-        match self.data.get(key).map(|entry| entry.obj()) {
-            Some(RedisObject::Hash(h)) => Ok(Some(h)),
-            Some(_) => Err(Frame::Error(WRONGTYPE.into())),
-            None => Ok(None),
-        }
+        self.prepare_read_access(key);
+        Self::entry_or_wrongtype(self.entry_obj_ref(key), |obj| match obj {
+            RedisObject::Hash(hash) => Some(hash),
+            _ => None,
+        })
     }
 
     /// Return an exclusive reference to a hash (for mutations like HDEL).
     #[cfg(test)]
     pub(crate) fn get_hash_mut(&mut self, key: &str) -> Result<Option<&mut Hash>, Frame> {
-        self.expire_if_needed(key);
-        self.touch(key);
-        match self.entry_make_mut(key).map(|entry| entry.obj_mut_cow()) {
-            Some(RedisObject::Hash(h)) => Ok(Some(h)),
-            Some(_) => Err(Frame::Error(WRONGTYPE.into())),
-            None => Ok(None),
-        }
+        self.prepare_write_access(key);
+        Self::entry_or_wrongtype_mut(self.entry_obj_mut_cow(key), |obj| match obj {
+            RedisObject::Hash(hash) => Some(hash),
+            _ => None,
+        })
     }
 
     /// Return a shared reference to a list.
     pub(crate) fn get_list(&mut self, key: &str) -> Result<Option<&List>, Frame> {
-        self.expire_if_needed(key);
-        self.touch(key);
-        match self.data.get(key).map(|entry| entry.obj()) {
-            Some(RedisObject::List(l)) => Ok(Some(l)),
-            Some(_) => Err(Frame::Error(WRONGTYPE.into())),
-            None => Ok(None),
-        }
+        self.prepare_read_access(key);
+        Self::entry_or_wrongtype(self.entry_obj_ref(key), |obj| match obj {
+            RedisObject::List(list) => Some(list),
+            _ => None,
+        })
     }
 
     /// Return (or create) a mutable hash for the given key.
@@ -299,16 +383,13 @@ impl Db {
     /// Returns `Err(Frame)` if the key already holds a non-Hash type.
     #[cfg(test)]
     pub(crate) fn get_or_insert_hash(&mut self, key: String) -> Result<&mut Hash, Frame> {
-        self.expire_if_needed(&key);
-        self.touch(&key);
-        if !self.data.contains_key(&key) {
-            self.set(key.clone(), RedisObject::Hash(Hash::new()));
-        }
-        let entry = self.entry_make_mut(&key).expect("just inserted");
-        match entry.obj_mut_cow() {
-            RedisObject::Hash(h) => Ok(h),
-            _ => Err(Frame::Error(WRONGTYPE.into())),
-        }
+        self.prepare_write_access(&key);
+        self.ensure_hash_key(&key);
+        Self::entry_or_wrongtype_mut(self.entry_obj_mut_cow(&key), |obj| match obj {
+            RedisObject::Hash(hash) => Some(hash),
+            _ => None,
+        })?
+        .ok_or_else(|| Frame::Error("ERR internal error".into()))
     }
 
     /// Return (or create) a mutable list for the given key.
@@ -316,16 +397,13 @@ impl Db {
     /// Returns `Err(Frame)` if the key already holds a non-List type.
     #[cfg(test)]
     pub(crate) fn get_or_insert_list(&mut self, key: String) -> Result<&mut List, Frame> {
-        self.expire_if_needed(&key);
-        self.touch(&key);
-        if !self.data.contains_key(&key) {
-            self.set(key.clone(), RedisObject::List(List::new()));
-        }
-        let entry = self.entry_make_mut(&key).expect("just inserted");
-        match entry.obj_mut_cow() {
-            RedisObject::List(l) => Ok(l),
-            _ => Err(Frame::Error(WRONGTYPE.into())),
-        }
+        self.prepare_write_access(&key);
+        self.ensure_list_key(&key);
+        Self::entry_or_wrongtype_mut(self.entry_obj_mut_cow(&key), |obj| match obj {
+            RedisObject::List(list) => Some(list),
+            _ => None,
+        })?
+        .ok_or_else(|| Frame::Error("ERR internal error".into()))
     }
 
     pub(crate) fn hash_upsert_many(
@@ -333,31 +411,22 @@ impl Db {
         key: String,
         pairs: Vec<(Bytes, Bytes)>,
     ) -> Result<i64, Frame> {
-        self.expire_if_needed(&key);
-        self.touch(&key);
-        if !self.data.contains_key(&key) {
-            self.set(key.clone(), RedisObject::Hash(Hash::new()));
-        }
+        self.prepare_write_access(&key);
+        self.ensure_hash_key(&key);
 
-        let (added, before_size, after_size) = {
-            let entry = self
-                .entry_make_mut(&key)
-                .expect("key exists after insertion");
-            match entry.obj_mut_cow() {
-                RedisObject::Hash(hash) => {
-                    let before_size = hash.estimated_size();
-                    let added = pairs
-                        .into_iter()
-                        .map(|(field, value)| hash.insert(field, value) as i64)
-                        .sum();
-                    let after_size = hash.estimated_size();
-                    (added, before_size, after_size)
-                }
-                _ => return Err(Frame::Error(WRONGTYPE.into())),
-            }
-        };
+        let (added, before_size, after_size) = self
+            .with_hash_mut(&key, |hash| {
+                let before_size = hash.estimated_size();
+                let added = pairs
+                    .into_iter()
+                    .map(|(field, value)| hash.insert(field, value) as i64)
+                    .sum();
+                let after_size = hash.estimated_size();
+                (added, before_size, after_size)
+            })?
+            .ok_or_else(|| Frame::Error("ERR internal error".into()))?;
 
-        self.apply_size_delta(before_size, after_size);
+        self.apply_collection_size_delta(before_size, after_size);
         Ok(added)
     }
 
@@ -366,27 +435,22 @@ impl Db {
         key: String,
         fields: Vec<Bytes>,
     ) -> Result<Option<i64>, Frame> {
-        self.expire_if_needed(&key);
-        self.touch(&key);
+        self.prepare_write_access(&key);
 
         if !self.data.contains_key(&key) {
             return Ok(None);
         }
 
-        let (removed, before_size, after_size) = {
-            let entry = self.entry_make_mut(&key).expect("key existence checked");
-            match entry.obj_mut_cow() {
-                RedisObject::Hash(hash) => {
-                    let before_size = hash.estimated_size();
-                    let removed = fields.iter().map(|field| hash.remove(field) as i64).sum();
-                    let after_size = hash.estimated_size();
-                    (removed, before_size, after_size)
-                }
-                _ => return Err(Frame::Error(WRONGTYPE.into())),
-            }
-        };
+        let (removed, before_size, after_size) = self
+            .with_hash_mut(&key, |hash| {
+                let before_size = hash.estimated_size();
+                let removed = fields.iter().map(|field| hash.remove(field) as i64).sum();
+                let after_size = hash.estimated_size();
+                (removed, before_size, after_size)
+            })?
+            .ok_or_else(|| Frame::Error("ERR internal error".into()))?;
 
-        self.apply_size_delta(before_size, after_size);
+        self.apply_collection_size_delta(before_size, after_size);
         Ok(Some(removed))
     }
 
@@ -396,34 +460,25 @@ impl Db {
         values: Vec<Bytes>,
         front: bool,
     ) -> Result<usize, Frame> {
-        self.expire_if_needed(&key);
-        self.touch(&key);
-        if !self.data.contains_key(&key) {
-            self.set(key.clone(), RedisObject::List(List::new()));
-        }
+        self.prepare_write_access(&key);
+        self.ensure_list_key(&key);
 
-        let (len, before_size, after_size) = {
-            let entry = self
-                .entry_make_mut(&key)
-                .expect("key exists after insertion");
-            match entry.obj_mut_cow() {
-                RedisObject::List(list) => {
-                    let before_size = list.estimated_size();
-                    for value in values {
-                        if front {
-                            list.push_front(value);
-                        } else {
-                            list.push_back(value);
-                        }
+        let (len, before_size, after_size) = self
+            .with_list_mut(&key, |list| {
+                let before_size = list.estimated_size();
+                for value in values {
+                    if front {
+                        list.push_front(value);
+                    } else {
+                        list.push_back(value);
                     }
-                    let after_size = list.estimated_size();
-                    (list.len(), before_size, after_size)
                 }
-                _ => return Err(Frame::Error(WRONGTYPE.into())),
-            }
-        };
+                let after_size = list.estimated_size();
+                (list.len(), before_size, after_size)
+            })?
+            .ok_or_else(|| Frame::Error("ERR internal error".into()))?;
 
-        self.apply_size_delta(before_size, after_size);
+        self.apply_collection_size_delta(before_size, after_size);
         Ok(len)
     }
 
@@ -433,55 +488,50 @@ impl Db {
         count: Option<u64>,
         front: bool,
     ) -> Result<Option<Vec<Bytes>>, Frame> {
-        self.expire_if_needed(&key);
-        self.touch(&key);
+        self.prepare_write_access(&key);
 
         if !self.data.contains_key(&key) {
             return Ok(None);
         }
 
-        let (values, before_size, after_size) = {
-            let entry = self.entry_make_mut(&key).expect("key existence checked");
-            match entry.obj_mut_cow() {
-                RedisObject::List(list) => {
-                    let before_size = list.estimated_size();
-                    let mut values = Vec::new();
+        let (values, before_size, after_size) = self
+            .with_list_mut(&key, |list| {
+                let before_size = list.estimated_size();
+                let mut values = Vec::new();
 
-                    match count {
-                        None => {
+                match count {
+                    None => {
+                        let value = if front {
+                            list.pop_front()
+                        } else {
+                            list.pop_back()
+                        };
+                        if let Some(value) = value {
+                            values.push(value);
+                        }
+                    }
+                    Some(n) => {
+                        values.reserve(n as usize);
+                        for _ in 0..n {
                             let value = if front {
                                 list.pop_front()
                             } else {
                                 list.pop_back()
                             };
-                            if let Some(value) = value {
-                                values.push(value);
-                            }
-                        }
-                        Some(n) => {
-                            values.reserve(n as usize);
-                            for _ in 0..n {
-                                let value = if front {
-                                    list.pop_front()
-                                } else {
-                                    list.pop_back()
-                                };
-                                match value {
-                                    Some(value) => values.push(value),
-                                    None => break,
-                                }
+                            match value {
+                                Some(value) => values.push(value),
+                                None => break,
                             }
                         }
                     }
-
-                    let after_size = list.estimated_size();
-                    (values, before_size, after_size)
                 }
-                _ => return Err(Frame::Error(WRONGTYPE.into())),
-            }
-        };
 
-        self.apply_size_delta(before_size, after_size);
+                let after_size = list.estimated_size();
+                (values, before_size, after_size)
+            })?
+            .ok_or_else(|| Frame::Error("ERR internal error".into()))?;
+
+        self.apply_collection_size_delta(before_size, after_size);
         Ok(Some(values))
     }
 
@@ -491,12 +541,11 @@ impl Db {
         key.len() + 64
     }
 
+    // Backward-compatible alias for older call-sites while keeping the new
+    // helper name explicit at read sites.
+    #[allow(dead_code)]
     fn apply_size_delta(&mut self, before: usize, after: usize) {
-        if after >= before {
-            self.used_memory += after - before;
-        } else {
-            self.used_memory = self.used_memory.saturating_sub(before - after);
-        }
+        self.apply_collection_size_delta(before, after);
     }
 }
 
@@ -761,5 +810,18 @@ mod tests {
         let keys = db.random_keys_with_expiry(10);
         assert_eq!(keys.len(), 1);
         assert_eq!(keys[0], "has_exp");
+    }
+
+    #[test]
+    fn with_hash_mut_missing_key_returns_none() {
+        let mut db = db();
+        assert_eq!(db.with_hash_mut("missing", |_| 1).unwrap(), None);
+    }
+
+    #[test]
+    fn with_hash_mut_wrong_type_returns_wrongtype() {
+        let mut db = db();
+        db.set("k".into(), RedisObject::Str(b("v")));
+        assert_eq!(db.with_hash_mut("k", |_| 1).unwrap_err(), wrongtype());
     }
 }

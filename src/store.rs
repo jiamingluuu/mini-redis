@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+use bytes::Bytes;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::cmd::{Command, CommandHandler, IntoResp};
@@ -8,6 +9,7 @@ use crate::db::Db;
 use crate::eviction::{self, EvictionConfig};
 use crate::persist::FsyncPolicy;
 use crate::persist::aof::Aof;
+use crate::persist::rdb::encode_snapshot;
 use crate::resp::frame::Frame;
 
 // ---------------------------------------------------------------------------
@@ -139,120 +141,155 @@ impl Store {
 
     fn handle(&mut self, msg: StoreCmd) {
         match msg {
-            StoreCmd::Execute { cmd, reply } => {
-                let frame = self.execute(cmd);
-                let _ = reply.send(frame);
-            }
-            StoreCmd::Save { reply } => {
-                let frame = if let Some(frame) = self.aof_misconf_frame() {
-                    frame
-                } else {
-                    match &mut self.aof {
-                        Some(aof) => match aof.fsync() {
-                            Ok(()) => Frame::Simple("OK".into()),
-                            Err(e) => {
-                                self.record_aof_error(format!("AOF fsync failed: {e}"));
-                                self.aof_misconf_frame()
-                                    .expect("latched AOF error should produce a reply")
-                            }
-                        },
-                        None => Frame::Error("ERR AOF is not enabled".into()),
+            StoreCmd::Execute { cmd, reply } => self.handle_execute(cmd, reply),
+            StoreCmd::Save { reply } => self.handle_save(reply),
+            StoreCmd::BgSave { path, reply } => self.handle_bgsave_start(path, reply),
+            StoreCmd::BgSaveDone { result, duration } => self.handle_bgsave_done(result, duration),
+        }
+    }
+
+    fn handle_execute(&mut self, cmd: Command, reply: oneshot::Sender<Frame>) {
+        let frame = self.execute(cmd);
+        let _ = reply.send(frame);
+    }
+
+    fn handle_save(&mut self, reply: oneshot::Sender<Frame>) {
+        let frame = if let Some(frame) = self.reject_if_aof_misconf() {
+            frame
+        } else {
+            match &mut self.aof {
+                Some(aof) => match aof.fsync() {
+                    Ok(()) => Frame::Simple("OK".into()),
+                    Err(e) => {
+                        self.record_aof_error(format!("AOF fsync failed: {e}"));
+                        self.aof_misconf_frame()
+                            .expect("latched AOF error should produce a reply")
                     }
-                };
-                let _ = reply.send(frame);
+                },
+                None => Frame::Error("ERR AOF is not enabled".into()),
             }
-            StoreCmd::BgSave { path, reply } => {
-                // REDIS: Return BUSY if a background save is already in progress.
-                if self.bgsave_running {
-                    let _ = reply.send(Frame::Error(
-                        "ERR Background save already in progress".into(),
-                    ));
-                    return;
-                }
+        };
+        let _ = reply.send(frame);
+    }
 
-                // REDIS: Snapshot boundary is when BGSAVE is handled by the main
-                // loop. We capture both snapshot data and snapshot time here.
-                let snapshot_ms = crate::entry::now_ms();
-                let snapshot = self.db.snapshot();
-                let tx = self.tx.clone();
+    fn handle_bgsave_start(&mut self, path: PathBuf, reply: oneshot::Sender<Frame>) {
+        // REDIS: Return BUSY if a background save is already in progress.
+        if self.bgsave_running {
+            let _ = reply.send(Frame::Error(
+                "ERR Background save already in progress".into(),
+            ));
+            return;
+        }
 
-                self.bgsave_running = true;
-                let _ = reply.send(Frame::Simple("Background saving started".into()));
+        let (snapshot, snapshot_ms) = self.start_bgsave_snapshot();
+        self.bgsave_running = true;
+        let _ = reply.send(Frame::Simple("Background saving started".into()));
+        self.spawn_bgsave_worker(snapshot, path, snapshot_ms);
+    }
 
-                tokio::spawn(async move {
-                    let started = std::time::Instant::now();
-                    let result = match tokio::task::spawn_blocking(move || {
-                        crate::persist::rdb::encode_snapshot(&snapshot, &path, snapshot_ms)
-                    })
-                    .await
-                    {
-                        Ok(Ok(())) => Ok(()),
-                        Ok(Err(e)) => Err(e.to_string()),
-                        Err(e) => Err(format!("BGSAVE task failed: {e}")),
-                    };
+    fn start_bgsave_snapshot(&self) -> (crate::db::DbSnapshot, u64) {
+        // REDIS: Snapshot boundary is when BGSAVE is handled by the main loop.
+        let snapshot_ms = crate::entry::now_ms();
+        let snapshot = self.db.snapshot();
+        (snapshot, snapshot_ms)
+    }
 
-                    let _ = tx
-                        .send(StoreCmd::BgSaveDone {
-                            result,
-                            duration: started.elapsed(),
-                        })
-                        .await;
-                });
+    fn spawn_bgsave_worker(
+        &self,
+        snapshot: crate::db::DbSnapshot,
+        path: PathBuf,
+        snapshot_ms: u64,
+    ) {
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let started = std::time::Instant::now();
+            let result = match tokio::task::spawn_blocking(move || {
+                encode_snapshot(&snapshot, &path, snapshot_ms)
+            })
+            .await
+            {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(e)) => Err(e.to_string()),
+                Err(e) => Err(format!("BGSAVE task failed: {e}")),
+            };
+
+            let _ = tx
+                .send(StoreCmd::BgSaveDone {
+                    result,
+                    duration: started.elapsed(),
+                })
+                .await;
+        });
+    }
+
+    fn handle_bgsave_done(&mut self, result: Result<(), String>, duration: Duration) {
+        self.bgsave_running = false;
+        self.last_bgsave_duration = Some(duration);
+        match result {
+            Ok(()) => {
+                self.last_bgsave_error = None;
             }
-            StoreCmd::BgSaveDone { result, duration } => {
-                self.bgsave_running = false;
-                self.last_bgsave_duration = Some(duration);
-                match result {
-                    Ok(()) => {
-                        self.last_bgsave_error = None;
-                    }
-                    Err(err) => {
-                        eprintln!("BGSAVE error: {err}");
-                        self.last_bgsave_error = Some(err);
-                    }
-                }
+            Err(err) => {
+                eprintln!("BGSAVE error: {err}");
+                self.last_bgsave_error = Some(err);
             }
         }
     }
 
     fn execute(&mut self, cmd: Command) -> Frame {
         match cmd {
-            Command::Write(w) => {
-                if let Some(frame) = self.aof_misconf_frame() {
-                    return frame;
-                }
-
-                // REDIS: processCommand() in server.c calls freeMemoryIfNeeded()
-                // before executing any write command. If we're over maxmemory with
-                // NoEviction policy, reject the write with an OOM error.
-                if !eviction::eviction_cycle(&mut self.db, &self.eviction_config) {
-                    return Frame::Error(
-                        "OOM command not allowed when used memory > 'maxmemory'".into(),
-                    );
-                }
-
-                // REDIS: AOF logs the command *after* successful execution.
-                // We serialize the RESP bytes *before* execute() consumes `w`,
-                // since IntoResp::to_resp_bytes takes &self (non-consuming).
-                let resp_bytes = w.to_resp_bytes();
-                let frame = w.execute(&mut self.db);
-
-                // Only log successful mutations — WRONGTYPE errors mean the
-                // command had no effect and should not be replayed.
-                if !matches!(frame, Frame::Error(_))
-                    && let Some(aof) = &mut self.aof
-                    && let Err(e) = aof.append_bytes(&resp_bytes)
-                {
-                    self.record_aof_error(format!("AOF append failed: {e}"));
-                    return self
-                        .aof_misconf_frame()
-                        .expect("latched AOF error should produce a reply");
-                }
-
-                frame
-            }
+            Command::Write(w) => self.execute_write_and_encode_aof(w),
             Command::Read(r) => r.execute(&mut self.db),
         }
+    }
+
+    fn execute_write_and_encode_aof(&mut self, w: crate::cmd::WriteCmd) -> Frame {
+        if let Some(frame) = self.reject_if_aof_misconf() {
+            return frame;
+        }
+        if let Some(frame) = self.reject_if_oom() {
+            return frame;
+        }
+
+        // REDIS: AOF logs the command *after* successful execution.
+        // We serialize RESP bytes before execute() consumes the write command.
+        let resp_bytes = w.to_resp_bytes();
+        let frame = w.execute(&mut self.db);
+        if matches!(frame, Frame::Error(_)) {
+            return frame;
+        }
+
+        if let Some(frame) = self.append_aof_or_latch_error(&resp_bytes) {
+            return frame;
+        }
+
+        frame
+    }
+
+    fn reject_if_aof_misconf(&self) -> Option<Frame> {
+        self.aof_misconf_frame()
+    }
+
+    fn reject_if_oom(&mut self) -> Option<Frame> {
+        // REDIS: processCommand() in server.c calls freeMemoryIfNeeded()
+        // before executing any write command.
+        if eviction::eviction_cycle(&mut self.db, &self.eviction_config) {
+            None
+        } else {
+            Some(Frame::Error(
+                "OOM command not allowed when used memory > 'maxmemory'".into(),
+            ))
+        }
+    }
+
+    fn append_aof_or_latch_error(&mut self, resp_bytes: &Bytes) -> Option<Frame> {
+        if let Some(aof) = &mut self.aof
+            && let Err(e) = aof.append_bytes(resp_bytes)
+        {
+            self.record_aof_error(format!("AOF append failed: {e}"));
+            return self.aof_misconf_frame();
+        }
+        None
     }
 
     fn record_aof_error(&mut self, message: String) {
